@@ -11,6 +11,7 @@ obj-$(CONFIG_RAVB) += ravb.o
 
 obj-$(CONFIG_RENESAS_ETHER_SWITCH) += rswitch.o
 obj-$(CONFIG_RENESAS_ETHER_SWITCH_XENBACK) += rswitch_xenback.o
+obj-$(CONFIG_RENESAS_ETHER_SWITCH_XENFRONT) += rswitch_xenfront.o
 
 rtsn_drv-objs := rtsn.o rtsn_ptp.o
 
