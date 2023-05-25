@@ -203,6 +203,7 @@ struct rswitch_device {
 
 	int port;
 	struct rswitch_etha *etha;
+	int remote_chain;
 };
 
 struct rswitch_private {
