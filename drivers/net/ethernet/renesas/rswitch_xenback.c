@@ -163,7 +163,7 @@ static int rswitch_vmq_back_probe(struct xenbus_device *dev,
 
 	if (!be) {
 		xenbus_dev_fatal(dev, -ENOMEM,
-				 "allocating backend structure");
+					"allocating backend structure");
 		return -ENOMEM;
 	}
 
@@ -220,7 +220,6 @@ static int rswitch_vmq_back_probe(struct xenbus_device *dev,
 
 		be->type = RSWITCH_PV_TSN;
 		netif_dormant_on(rdev->ndev);
-		rswitch_mfwd_set_port_based(be->rswitch_priv, be->if_num, be->rx_chain);
 	} else {
 		xenbus_dev_fatal(dev, err, "Unknown device type: %s ", type_str);
 		kfree(type_str);
@@ -335,9 +334,12 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 	be->tx_evtchn = tx_evt;
 	be->rx_evtchn = rx_evt;
 
+	rswitch_gwca_chain_register(be->rswitch_priv, be->tx_chain, false);
+	rswitch_gwca_chain_register(be->rswitch_priv, be->rx_chain, true);
+
 	err = bind_interdomain_evtchn_to_irqhandler_lateeoi(dev->otherend_id,
-		tx_evt, rswitch_vmq_back_tx_interrupt, 0,
-		be->name, be);
+				tx_evt, rswitch_vmq_back_tx_interrupt, 0,
+				be->name, be);
 	if (err < 0) {
 		xenbus_dev_fatal(dev, err, "Failed to bind tx_evt IRQ: %d", err);
 		return err;
@@ -345,26 +347,31 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 	be->tx_irq = err;
 
 	err = bind_interdomain_evtchn_to_irqhandler_lateeoi(dev->otherend_id,
-	        rx_evt, rswitch_vmq_back_rx_interrupt, 0,
-		be->name, be);
+				rx_evt, rswitch_vmq_back_rx_interrupt, 0,
+				be->name, be);
 	if (err < 0) {
 		xenbus_dev_fatal(dev, err, "Failed to bind rx_evt IRQ: %d", err);
 		return err;
 	}
 	be->rx_irq = err;
 
-	rswitch_gwca_chain_register(be->rswitch_priv, be->tx_chain, false);
-	rswitch_gwca_chain_register(be->rswitch_priv, be->rx_chain, true);
-
 	notify_remote_via_evtchn(tx_evt);
 	notify_remote_via_evtchn(rx_evt);
 
-	if (be->type == RSWITCH_PV_VMQ)	{
-		be->rdev->remote_chain = be->rx_chain->index;
-		err = register_netdev(be->rdev->ndev);
+	switch (be->type) {
+		case RSWITCH_PV_VMQ:
+			be->rdev->remote_chain = be->rx_chain->index;
+			err = register_netdev(be->rdev->ndev);
+			break;
+		case RSWITCH_PV_TSN:
+			rswitch_mfwd_set_port_based(be->rswitch_priv, be->if_num, be->rx_chain);
+			err = 0;
+			break;
+		default:
+			WARN(1, "Unknown rswitch be->type: %d\n", be->type);
+			err = -ENODEV;
+			break;
 	}
-	else
-		err = 0;
 
 	return err;
 }
