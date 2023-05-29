@@ -99,6 +99,8 @@ enum DIE_DT {
 #define RSWITCH_IPV4_PROTO_OFFSET (23)
 #define RSWITCH_IPV4_SRC_OFFSET (26)
 #define RSWITCH_IPV4_DST_OFFSET (30)
+#define RSWITCH_L4_SRC_PORT_OFFSET (34)
+#define RSWITCH_L4_DST_PORT_OFFSET (36)
 
 /* For timestamp descriptor in dptrl (Byte 4 to 7) */
 #define TS_DESC_TSUN(dptrl)	((dptrl) & GENMASK(7, 0))
