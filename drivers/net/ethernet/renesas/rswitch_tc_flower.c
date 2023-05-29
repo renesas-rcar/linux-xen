@@ -112,6 +112,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			pf_param.entries[pf_index].mask = ntohs(match.mask->n_proto);
 			pf_param.entries[pf_index].off = RSWITCH_IP_VERSION_OFFSET;
 			pf_param.entries[pf_index].type = PF_TWO_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 
@@ -121,6 +122,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			/* Using one byte in two-byte filter, make offset correction */
 			pf_param.entries[pf_index].off = RSWITCH_IPV4_PROTO_OFFSET - 1;
 			pf_param.entries[pf_index].type = PF_TWO_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 	}
@@ -142,6 +144,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			pf_param.entries[pf_index].mask = be32_to_cpu(match.mask->src);
 			pf_param.entries[pf_index].off = RSWITCH_IPV4_SRC_OFFSET;
 			pf_param.entries[pf_index].type = PF_FOUR_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 
@@ -150,6 +153,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			pf_param.entries[pf_index].mask = be32_to_cpu(match.mask->dst);
 			pf_param.entries[pf_index].off = RSWITCH_IPV4_DST_OFFSET;
 			pf_param.entries[pf_index].type = PF_FOUR_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 	}
@@ -175,6 +179,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			/* Using one byte in two-byte filter, make offset correction */
 			pf_param.entries[pf_index].off = RSWITCH_IPV4_TOS_OFFSET - 1;
 			pf_param.entries[pf_index].type = PF_TWO_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 
@@ -184,6 +189,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			/* Using one byte in two-byte filter, make offset correction */
 			pf_param.entries[pf_index].off = RSWITCH_IPV4_TTL_OFFSET - 1;
 			pf_param.entries[pf_index].type = PF_TWO_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 	}
@@ -207,6 +213,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			pf_param.entries[pf_index].mask = be16_to_cpu(match.mask->src);
 			pf_param.entries[pf_index].off = RSWITCH_L4_SRC_PORT_OFFSET;
 			pf_param.entries[pf_index].type = PF_TWO_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 
@@ -215,6 +222,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			pf_param.entries[pf_index].mask = be16_to_cpu(match.mask->dst);
 			pf_param.entries[pf_index].off = RSWITCH_L4_DST_PORT_OFFSET;
 			pf_param.entries[pf_index].type = PF_TWO_BYTE;
+			pf_param.entries[pf_index].mode = RSWITCH_PF_MASK_MODE;
 			pf_index++;
 		}
 	}
