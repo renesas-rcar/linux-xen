@@ -254,7 +254,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 				rc = rswitch_init_mask_pf_entry(&pf_param, PF_THREE_BYTE,
 							rswitch_mac_right_half(match.key->src),
 							rswitch_mac_right_half(match.mask->src),
-							RSWITCH_MAC_SRC_OFFSET - 3);
+							RSWITCH_MAC_SRC_OFFSET + 3);
 				if (rc)
 					goto free;
 			}
@@ -279,7 +279,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 				rc = rswitch_init_mask_pf_entry(&pf_param, PF_THREE_BYTE,
 							rswitch_mac_right_half(match.key->dst),
 							rswitch_mac_right_half(match.mask->dst),
-							RSWITCH_MAC_DST_OFFSET - 3);
+							RSWITCH_MAC_DST_OFFSET + 3);
 				if (rc)
 					goto free;
 			}
