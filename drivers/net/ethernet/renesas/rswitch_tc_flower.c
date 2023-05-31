@@ -34,7 +34,7 @@ static int rswitch_tc_flower_validate_action(struct rswitch_device *dev,
 	struct flow_action_entry *act;
 	struct flow_action *actions = &rule->action;
 	int i;
-	bool redirect = false, dmac_change = false;
+	bool redirect = false, dmac_change = false, vlan_change = false;
 
 	flow_action_for_each(i, act, actions) {
 		switch (act->id) {
@@ -58,6 +58,14 @@ static int rswitch_tc_flower_validate_action(struct rswitch_device *dev,
 			}
 			dmac_change = true;
 			break;
+		case FLOW_ACTION_VLAN_MANGLE:
+			if (act->vlan.proto != ETH_P_8021Q) {
+				pr_err("Unsupported VLAN proto for offload!\n");
+				return -EOPNOTSUPP;
+			}
+
+			vlan_change = true;
+			break;
 		default:
 			pr_err("Unsupported for offload action id = %d\n", act->id);
 			return -EOPNOTSUPP;
@@ -66,6 +74,11 @@ static int rswitch_tc_flower_validate_action(struct rswitch_device *dev,
 
 	if (dmac_change && !redirect) {
 		pr_err("dst MAC change is supported only with redirect\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (vlan_change & !redirect) {
+		pr_err("VLAN mangle is supported only with redirect\n");
 		return -EOPNOTSUPP;
 	}
 
@@ -89,12 +102,23 @@ static int rswitch_tc_flower_setup_redirect_action(struct rswitch_tc_filter *f)
 	f->param.slv = BIT(rdev->port);
 	f->param.dv = BIT(f->target_rdev->port);
 	f->param.csd = 0;
-	if (f->action & ACTION_CHANGE_DMAC) {
+
+	if (f->action & (ACTION_CHANGE_DMAC | ACTION_VLAN_CHANGE)) {
 		f->param.l23_info.priv = rdev->priv;
-		ether_addr_copy(f->param.l23_info.dst_mac, f->dmac);
-		f->param.l23_info.update_dst_mac = true;
 		f->param.l23_info.routing_number = rswitch_rn_get(rdev->priv);
 		f->param.l23_info.routing_port_valid = BIT(rdev->port) | BIT(f->target_rdev->port);
+
+		if (f->action & ACTION_CHANGE_DMAC) {
+			ether_addr_copy(f->param.l23_info.dst_mac, f->dmac);
+			f->param.l23_info.update_dst_mac = true;
+		}
+
+		if (f->action & ACTION_VLAN_CHANGE) {
+			f->param.l23_info.update_ctag_vlan_id = true;
+			f->param.l23_info.update_ctag_vlan_prio = true;
+			f->param.l23_info.vlan_id = f->vlan_id;
+			f->param.l23_info.vlan_prio = f->vlan_prio;
+		}
 	}
 
 	return 0;
@@ -389,6 +413,11 @@ static int rswitch_tc_flower_setup_action(struct rswitch_tc_filter *f,
 				*/
 				f->action |= ACTION_CHANGE_DMAC;
 				rswitch_parse_pedit(f, act);
+				break;
+			case FLOW_ACTION_VLAN_MANGLE:
+				f->action |= ACTION_VLAN_CHANGE;
+				f->vlan_id = act->vlan.vid;
+				f->vlan_prio = act->vlan.prio;
 				break;
 			default:
 				/*
