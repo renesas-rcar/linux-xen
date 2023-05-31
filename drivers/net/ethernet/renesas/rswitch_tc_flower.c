@@ -99,78 +99,15 @@ static int rswitch_tc_flower_setup_redirect_action(struct rswitch_tc_filter *f)
 	return 0;
 }
 
-static int rswitch_tc_flower_setup_action(struct rswitch_tc_filter *f,
+static int rswitch_tc_flower_setup_match(struct rswitch_tc_filter *f,
 			struct flow_rule *rule)
 {
-	struct flow_action_entry *act;
-	struct flow_action *actions = &rule->action;
-	int i;
-
-	flow_action_for_each(i, act, actions) {
-		switch (act->id) {
-		case FLOW_ACTION_DROP:
-			f->action = ACTION_DROP;
-			break;
-		case FLOW_ACTION_REDIRECT:
-			f->action |= ACTION_MIRRED_REDIRECT;
-			f->target_rdev = netdev_priv(act->dev);
-			break;
-		case FLOW_ACTION_MANGLE:
-			/*
-			 * The only FLOW_ACT_MANGLE_HDR_TYPE_ETH is supported,
-			 * sanitized by rswitch_tc_flower_validate_action().
-			 */
-			f->action |= ACTION_CHANGE_DMAC;
-			rswitch_parse_pedit(f, act);
-			break;
-		default:
-			/*
-			 * Should not come here, such action will be dropped by
-			 * rswitch_tc_flower_validate_action().
-			 */
-			pr_err("Unsupported action for offload!\n");
-			return -EOPNOTSUPP;
-		}
-	}
-
-	if (f->action & ACTION_DROP) {
-		return rswitch_tc_flower_setup_drop_action(f);
-	}
-
-	if (f->action & ACTION_MIRRED_REDIRECT) {
-		return rswitch_tc_flower_setup_redirect_action(f);
-	}
-
-	return -EOPNOTSUPP;
-}
-
-static int rswitch_tc_flower_replace(struct net_device *dev,
-			struct flow_cls_offload *cls_flower)
-{
-	struct flow_rule *rule = flow_cls_offload_flow_rule(cls_flower);
-	struct rswitch_device *rdev = netdev_priv(dev);
-	struct rswitch_private *priv = rdev->priv;
-	struct rswitch_tc_filter *f;
 	struct rswitch_pf_param pf_param = {0};
 	int rc = 0, i;
 	u16 addr_type = 0;
 
-	if (rswitch_tc_flower_validate_match(rule) ||
-				rswitch_tc_flower_validate_action(rdev, rule)) {
-		return -EOPNOTSUPP;
-	}
-
-	f = kzalloc(sizeof(*f), GFP_KERNEL);
-	if (!f) {
-		pr_err("Failed to allocate memory for tc flower filter\n");
-		return -ENOMEM;
-	}
-
-	f->rdev = rdev;
-	f->param.priv = priv;
-	/* Using cascade filter, src_ip field is not used */
-	f->param.src_ip = 0;
-	f->cookie = cls_flower->cookie;
+	pf_param.rdev = f->rdev;
+	pf_param.all_sources = false;
 
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
 		struct flow_match_control match;
@@ -193,7 +130,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 						ntohs(match.key->n_proto), ntohs(match.mask->n_proto),
 						RSWITCH_IP_VERSION_OFFSET);
 			if (rc)
-				goto free;
+				return rc;
 		}
 
 		if (match.mask->ip_proto) {
@@ -202,7 +139,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 						match.key->ip_proto, match.mask->ip_proto,
 						RSWITCH_IPV4_PROTO_OFFSET - 1);
 			if (rc)
-				goto free;
+				return rc;
 		}
 	}
 
@@ -227,21 +164,21 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 							rswitch_mac_right_half(match.key->src),
 							RSWITCH_MAC_SRC_OFFSET);
 				if (rc)
-					goto free;
+					return rc;
 			} else {
 				rc = rswitch_init_mask_pf_entry(&pf_param, PF_THREE_BYTE,
 							rswitch_mac_left_half(match.key->src),
 							rswitch_mac_left_half(match.mask->src),
 							RSWITCH_MAC_SRC_OFFSET);
 				if (rc)
-					goto free;
+					return rc;
 
 				rc = rswitch_init_mask_pf_entry(&pf_param, PF_THREE_BYTE,
 							rswitch_mac_right_half(match.key->src),
 							rswitch_mac_right_half(match.mask->src),
 							RSWITCH_MAC_SRC_OFFSET + 3);
 				if (rc)
-					goto free;
+					return rc;
 			}
 		}
 
@@ -252,21 +189,21 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 							rswitch_mac_right_half(match.key->dst),
 							RSWITCH_MAC_DST_OFFSET);
 				if (rc)
-					goto free;
+					return rc;
 			} else {
 				rc = rswitch_init_mask_pf_entry(&pf_param, PF_THREE_BYTE,
 							rswitch_mac_left_half(match.key->dst),
 							rswitch_mac_left_half(match.mask->dst),
 							RSWITCH_MAC_DST_OFFSET);
 				if (rc)
-					goto free;;
+					return rc;
 
 				rc = rswitch_init_mask_pf_entry(&pf_param, PF_THREE_BYTE,
 							rswitch_mac_right_half(match.key->dst),
 							rswitch_mac_right_half(match.mask->dst),
 							RSWITCH_MAC_DST_OFFSET + 3);
 				if (rc)
-					goto free;
+					return rc;
 			}
 		}
 	}
@@ -281,7 +218,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 						be32_to_cpu(match.key->src), be32_to_cpu(match.mask->src),
 						RSWITCH_IPV4_SRC_OFFSET);
 			if (rc)
-				goto free;
+				return rc;
 		}
 
 		if (match.mask->dst) {
@@ -289,7 +226,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 						be32_to_cpu(match.key->dst), be32_to_cpu(match.mask->dst),
 						RSWITCH_IPV4_DST_OFFSET);
 			if (rc)
-				goto free;
+				return rc;
 		}
 	}
 
@@ -311,14 +248,14 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 							be32_to_cpu(match.key->src.s6_addr32[1]),
 							RSWITCH_IPV6_SRC_OFFSET);
 				if (rc)
-					goto free;
+					return rc;
 
 				rc = rswitch_init_expand_pf_entry(&pf_param, PF_FOUR_BYTE,
 							be32_to_cpu(match.key->src.s6_addr32[2]),
 							be32_to_cpu(match.key->src.s6_addr32[3]),
 							RSWITCH_IPV6_SRC_OFFSET + 8);
 				if (rc)
-					goto free;
+					return rc;
 			} else {
 				/* Walk through all 128-bit or until we reach zero mask in addr */
 				for (i = 0; (i < 4) && match.mask->src.s6_addr32[i]; i++) {
@@ -327,7 +264,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 								be32_to_cpu(match.mask->src.s6_addr32[i]),
 								RSWITCH_IPV6_SRC_OFFSET + 4 * i);
 					if (rc)
-						goto free;
+						return rc;
 				}
 			}
 		}
@@ -339,14 +276,14 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 							be32_to_cpu(match.key->dst.s6_addr32[1]),
 							RSWITCH_IPV6_DST_OFFSET);
 				if (rc)
-					goto free;
+					return rc;
 
 				rc = rswitch_init_expand_pf_entry(&pf_param, PF_FOUR_BYTE,
 							be32_to_cpu(match.key->dst.s6_addr32[2]),
 							be32_to_cpu(match.key->dst.s6_addr32[3]),
 							RSWITCH_IPV6_DST_OFFSET + 8);
 				if (rc)
-					goto free;
+					return rc;
 			} else {
 				/* Walk through all 128-bit or until we reach zero mask in addr */
 				for (i = 0; (i < 4) && match.mask->dst.s6_addr32[i]; i++) {
@@ -355,7 +292,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 								be32_to_cpu(match.mask->dst.s6_addr32[i]),
 								RSWITCH_IPV6_DST_OFFSET + 4 * i);
 					if (rc)
-						goto free;
+						return rc;
 				}
 			}
 		}
@@ -371,7 +308,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			rc = rswitch_init_mask_pf_entry(&pf_param, PF_TWO_BYTE, match.key->tos,
 						match.mask->tos, RSWITCH_IPV4_TOS_OFFSET - 1);
 			if (rc)
-				goto free;
+				return rc;
 		}
 
 		if (match.mask->ttl) {
@@ -379,7 +316,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 			rc = rswitch_init_mask_pf_entry(&pf_param, PF_TWO_BYTE, match.key->ttl,
 						match.mask->ttl, RSWITCH_IPV4_TTL_OFFSET - 1);
 			if (rc)
-				goto free;
+				return rc;
 		}
 	}
 
@@ -393,7 +330,7 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 						be16_to_cpu(match.key->src), be16_to_cpu(match.mask->src),
 						RSWITCH_L4_SRC_PORT_OFFSET);
 			if (rc)
-				goto free;
+				return rc;
 		}
 
 		if (match.mask->dst) {
@@ -401,23 +338,95 @@ static int rswitch_tc_flower_replace(struct net_device *dev,
 						be16_to_cpu(match.key->dst), be16_to_cpu(match.mask->dst),
 						RSWITCH_L4_DST_PORT_OFFSET);
 			if (rc)
-				goto free;
+				return rc;
 		}
 	}
 
-	rc = rswitch_tc_flower_setup_action(f, rule);
-	if (rc) {
-		goto free;
-	}
-
-	pf_param.rdev = rdev;
-	pf_param.all_sources = false;
-
 	f->param.pf_cascade_index = rswitch_setup_pf(&pf_param);
-	if (f->param.pf_cascade_index < 0) {
-		rc = -E2BIG;
-		goto free;
+	if (f->param.pf_cascade_index < 0)
+		return -E2BIG;
+
+	return 0;
+}
+
+static int rswitch_tc_flower_setup_action(struct rswitch_tc_filter *f,
+			struct flow_rule *rule)
+{
+	struct flow_action_entry *act;
+	struct flow_action *actions = &rule->action;
+	int i;
+
+	flow_action_for_each(i, act, actions) {
+		switch (act->id) {
+			case FLOW_ACTION_DROP:
+				f->action = ACTION_DROP;
+				break;
+			case FLOW_ACTION_REDIRECT:
+				f->action |= ACTION_MIRRED_REDIRECT;
+				f->target_rdev = netdev_priv(act->dev);
+				break;
+			case FLOW_ACTION_MANGLE:
+				/*
+				* The only FLOW_ACT_MANGLE_HDR_TYPE_ETH is supported,
+				* sanitized by rswitch_tc_flower_validate_action().
+				*/
+				f->action |= ACTION_CHANGE_DMAC;
+				rswitch_parse_pedit(f, act);
+				break;
+			default:
+				/*
+				* Should not come here, such action will be dropped by
+				* rswitch_tc_flower_validate_action().
+				*/
+				pr_err("Unsupported action for offload!\n");
+				return -EOPNOTSUPP;
+		}
 	}
+
+	if (f->action & ACTION_DROP) {
+		return rswitch_tc_flower_setup_drop_action(f);
+	}
+
+	if (f->action & ACTION_MIRRED_REDIRECT) {
+		return rswitch_tc_flower_setup_redirect_action(f);
+	}
+
+	return -EOPNOTSUPP;
+}
+
+static int rswitch_tc_flower_replace(struct net_device *dev,
+			struct flow_cls_offload *cls_flower)
+{
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls_flower);
+	struct rswitch_device *rdev = netdev_priv(dev);
+	struct rswitch_private *priv = rdev->priv;
+	struct rswitch_tc_filter *f;
+	int rc;
+
+	if (rswitch_tc_flower_validate_match(rule) ||
+		rswitch_tc_flower_validate_action(rdev, rule)) {
+		return -EOPNOTSUPP;
+	}
+
+	f = kzalloc(sizeof(*f), GFP_KERNEL);
+	if (!f) {
+		pr_err("Failed to allocate memory for tc flower filter\n");
+		return -ENOMEM;
+	}
+
+	f->rdev = rdev;
+	f->param.priv = priv;
+	/* Using cascade filter, src_ip field is not used */
+	f->param.src_ip = 0;
+	f->cookie = cls_flower->cookie;
+
+	rc = rswitch_tc_flower_setup_match(f, rule);
+	if (rc)
+		goto free;
+
+	rc = rswitch_tc_flower_setup_action(f, rule);
+	if (rc)
+		goto put_pf;
 
 	if (rswitch_add_l3fwd(&f->param)) {
 		rc = -EBUSY;
