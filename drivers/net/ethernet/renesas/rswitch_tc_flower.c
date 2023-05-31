@@ -59,7 +59,7 @@ static int rswitch_tc_flower_validate_action(struct rswitch_device *dev,
 			dmac_change = true;
 			break;
 		case FLOW_ACTION_VLAN_MANGLE:
-			if (act->vlan.proto != ETH_P_8021Q) {
+			if (be16_to_cpu(act->vlan.proto) != ETH_P_8021Q) {
 				pr_err("Unsupported VLAN proto for offload!\n");
 				return -EOPNOTSUPP;
 			}
