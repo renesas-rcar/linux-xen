@@ -952,6 +952,7 @@ struct rswitch_fib_event_work {
 struct rswitch_forward_work {
 	struct work_struct work;
 	struct rswitch_private *priv;
+	struct rswitch_device *ingress_dev;
 	u32 src_ip;
 	u32 dst_ip;
 };
@@ -1142,7 +1143,8 @@ static bool rswitch_is_chain_rxed(struct rswitch_gwca_chain *c, u8 unexpected)
 	return false;
 }
 
-void rswitch_add_ipv4_forward(struct rswitch_private *priv, u32 src_ip, u32 dst_ip);
+void rswitch_add_ipv4_forward(struct rswitch_private *priv, struct rswitch_device *ingress_dev,
+			      u32 src_ip, u32 dst_ip);
 
 static inline bool skb_is_vlan(struct sk_buff *skb)
 {
@@ -1202,7 +1204,7 @@ static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch
 			/* The L2 broadcast packets shouldn't be routed */
 			if (!is_broadcast_ether_addr(ethhdr->h_dest)) {
 				iphdr = ip_hdr(skb);
-				rswitch_add_ipv4_forward(priv, be32_to_cpu(iphdr->saddr),
+				rswitch_add_ipv4_forward(priv, rdev, be32_to_cpu(iphdr->saddr),
 							 be32_to_cpu(iphdr->daddr));
 			}
 		}
@@ -4225,8 +4227,6 @@ static void rswitch_forward_work(struct work_struct *work)
 		goto free;
 
 	rdev = routing_list->rdev;
-	if (rswitch_ipv4_resolve(rdev, fwd_work->dst_ip, mac))
-		goto free;
 
 	if (is_vlan_dev(rdev->ndev)) {
 		real_ndev = vlan_dev_real_dev(rdev->ndev);
@@ -4235,6 +4235,14 @@ static void rswitch_forward_work(struct work_struct *work)
 	} else {
 		param.dv = BIT(rdev->port);
 	}
+
+	/* Do not reroute traffic to the ingress port to avoid looping */
+	if (param.dv == BIT(fwd_work->ingress_dev->port))
+		goto free;
+
+	if (rswitch_ipv4_resolve(rdev, fwd_work->dst_ip, mac))
+		goto free;
+
 	param.csd = 0;
 	param.enable_sub_dst = false;
 	memcpy(param.l23_info.dst_mac, mac, ETH_ALEN);
@@ -4257,7 +4265,8 @@ free:
 	kfree(fwd_work);
 }
 
-void rswitch_add_ipv4_forward(struct rswitch_private *priv, u32 src_ip, u32 dst_ip)
+void rswitch_add_ipv4_forward(struct rswitch_private *priv, struct rswitch_device *ingress_dev,
+			      u32 src_ip, u32 dst_ip)
 {
 	struct rswitch_forward_work *fwd_work;
 
@@ -4269,6 +4278,7 @@ void rswitch_add_ipv4_forward(struct rswitch_private *priv, u32 src_ip, u32 dst_
 	fwd_work->priv = priv;
 	fwd_work->src_ip = src_ip;
 	fwd_work->dst_ip = dst_ip;
+	fwd_work->ingress_dev = ingress_dev;
 
 	queue_work(priv->rswitch_forward_wq, &fwd_work->work);
 }
