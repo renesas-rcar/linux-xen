@@ -4111,59 +4111,62 @@ static int rswitch_ipv4_resolve(struct rswitch_device *rdev, u32 ip, u8 mac[ETH_
 }
 
 /* Should be called with rswitch_priv->ipv4_forward_lock taken */
+#define RSWITCH_FRAME_TYPE_NUM 3
 static void rswitch_add_ipv4_forward_all_types(struct l3_ipv4_fwd_param *param,
 			struct rswitch_ipv4_route *routing_list)
 {
-	struct l3_ipv4_fwd_param_list *param_list;
+	struct l3_ipv4_fwd_param_list *param_list[RSWITCH_FRAME_TYPE_NUM] = {0};
 	struct rswitch_private *priv = routing_list->dev->priv;
-	const int frame_type_num = 3;
-	int i, j;
+	int i;
 
-	param_list = kcalloc(frame_type_num, sizeof(*param_list), GFP_ATOMIC);
-	if (!param_list)
-		return;
-
-	for (i = 0; i < frame_type_num; i++) {
-		param_list[i].param = kcalloc(frame_type_num, sizeof(*param), GFP_ATOMIC);
-		if (!param_list[i].param)
+	for (i = 0; i < RSWITCH_FRAME_TYPE_NUM; i++) {
+		param_list[i] = kzalloc(sizeof(**param_list), GFP_ATOMIC);
+		if (!param_list[i])
 			goto free;
-		memcpy(param_list[i].param, param, sizeof(*param));
+
+		param_list[i]->param = kzalloc(sizeof(*param), GFP_ATOMIC);
+		if (!param_list[i]->param)
+			goto free;
+
+		memcpy(param_list[i]->param, param, sizeof(*param));
 	}
 
-	param_list[0].param->frame_type = LTHSLP0v4OTHER;
-	param_list[1].param->frame_type = LTHSLP0v4UDP;
-	param_list[2].param->frame_type = LTHSLP0v4TCP;
+	param_list[0]->param->frame_type = LTHSLP0v4OTHER;
+	param_list[1]->param->frame_type = LTHSLP0v4UDP;
+	param_list[2]->param->frame_type = LTHSLP0v4TCP;
 
 	if (!priv->ipv4_forward_enabled)
 		/* Add these params only to list, not to HW */
 		goto list_add;
 
-	if (rswitch_add_l3fwd(param_list[0].param))
+	if (rswitch_add_l3fwd(param_list[0]->param))
 		goto free;
 
-	if (rswitch_add_l3fwd(param_list[1].param)) {
-		rswitch_remove_l3fwd(param_list[0].param);
+	if (rswitch_add_l3fwd(param_list[1]->param)) {
+		rswitch_remove_l3fwd(param_list[0]->param);
 		goto free;
 	}
 
-	if (rswitch_add_l3fwd(param_list[2].param)) {
-		rswitch_remove_l3fwd(param_list[0].param);
-		rswitch_remove_l3fwd(param_list[1].param);
+	if (rswitch_add_l3fwd(param_list[2]->param)) {
+		rswitch_remove_l3fwd(param_list[0]->param);
+		rswitch_remove_l3fwd(param_list[1]->param);
 		goto free;
 	}
 
 list_add:
-	list_add(&param_list[0].list, &routing_list->param_list);
-	list_add(&param_list[1].list, &routing_list->param_list);
-	list_add(&param_list[2].list, &routing_list->param_list);
+	list_add(&param_list[0]->list, &routing_list->param_list);
+	list_add(&param_list[1]->list, &routing_list->param_list);
+	list_add(&param_list[2]->list, &routing_list->param_list);
 
 	return;
 
 free:
-	for (j = 0; j < i; j++)
-		kfree(param_list[j].param);
-
-	kfree(param_list);
+	for (i = 0; i < RSWITCH_FRAME_TYPE_NUM; i++) {
+		if (param_list[i]) {
+			kfree(param_list[i]->param);
+			kfree(param_list[i]);
+		}
+	}
 }
 
 /* Should be called with rswitch_priv->ipv4_forward_lock taken */
@@ -4795,12 +4798,13 @@ static int renesas_eth_sw_remove(struct platform_device *pdev)
 static int __maybe_unused rswitch_suspend(struct device *dev)
 {
 	struct rswitch_private *priv = dev_get_drvdata(dev);
+	struct rswitch_device *rdev;
 	int i;
 
-	for (i = 0; i < num_ndev; i++) {
-		struct net_device *ndev = priv->rdev[i]->ndev;
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		struct net_device *ndev = rdev->ndev;
 
-		if (priv->rdev[i]->tx_chain->index < 0)
+		if (rdev->tx_chain->index < 0)
 			continue;
 
 		if (netif_running(ndev)) {
@@ -4810,7 +4814,7 @@ static int __maybe_unused rswitch_suspend(struct device *dev)
 
 		rswitch_txdmac_free(ndev, priv);
 		rswitch_rxdmac_free(ndev, priv);
-		priv->rdev[i]->etha->operated = false;
+		rdev->etha->operated = false;
 	}
 
 	priv->serdes_common_init = false;
@@ -4862,6 +4866,7 @@ out_dmac:
 static int __maybe_unused rswitch_resume(struct device *dev)
 {
 	struct rswitch_private *priv = dev_get_drvdata(dev);
+	struct rswitch_device *rdev;
 	int i, ret, err = 0;
 
 	ret = rswitch_desc_alloc(priv);
@@ -4897,10 +4902,10 @@ static int __maybe_unused rswitch_resume(struct device *dev)
 	if (ret)
 		return ret;
 
-	for (i = 0; i < num_ndev; i++) {
-		struct net_device *ndev = priv->rdev[i]->ndev;
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		struct net_device *ndev = rdev->ndev;
 
-		if (priv->rdev[i]->tx_chain->index >= 0) {
+		if (rdev->tx_chain->index >= 0) {
 			ret = rswitch_resume_chan(ndev);
 			if (ret) {
 				pr_info("Failed to resume %s", ndev->name);
