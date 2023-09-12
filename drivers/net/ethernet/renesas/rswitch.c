@@ -9,50 +9,40 @@
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
 #include <linux/kernel.h>
+#include <linux/ip.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/net_tstamp.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
+#include <linux/of_address.h>
 #include <linux/clk.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/reset.h>
+#include <linux/inetdevice.h>
+#include <net/rtnetlink.h>
+#include <net/nexthop.h>
+#include <net/netns/generic.h>
+#include <net/arp.h>
+#include <net/switchdev.h>
+#include <net/netevent.h>
 
 #include "rtsn_ptp.h"
+#include "rswitch.h"
+#include "rswitch_tc_filters.h"
 
 static void *debug_addr;
-static inline u32 rs_read32(void *addr)
-{
-	return ioread32(addr);
-}
-
-static inline void rs_write32(u32 data, void *addr)
-{
-	iowrite32(data, addr);
-}
 
 #define RSWITCH_NUM_HW		5
-#define RSWITCH_MAX_NUM_ETHA	3
-#define RSWITCH_MAX_NUM_NDEV	8
-#define RSWITCH_MAX_NUM_CHAINS	128
-
-#define RSWITCH_SERDES_NUM	3
 
 #define RSWITCH_GWCA_IDX_TO_HW_NUM(i)	((i) + RSWITCH_MAX_NUM_ETHA)
 #define RSWITCH_HW_NUM_TO_GWCA_IDX(i)	((i) - RSWITCH_MAX_NUM_ETHA)
-
-#define TX_RING_SIZE		1024
-#define RX_RING_SIZE		1024
-#define TS_RING_SIZE		(TX_RING_SIZE * RSWITCH_MAX_NUM_ETHA)
-
-#define PKT_BUF_SZ		1584
-#define RSWITCH_ALIGN		128
-#define RSWITCH_MAX_CTAG_PCP	7
 
 #define GWCA_TS_IRQ_RESOURCE_NAME	"gwca1_rxts0"
 #define GWCA_TS_IRQ_NAME		"rswitch: gwca1_rxts0"
@@ -763,12 +753,6 @@ enum rswitch_etha_mode {
 #define MLVC_PLV	BIT(16)
 
 /* GWCA */
-enum rswitch_gwca_mode {
-	GWMC_OPC_RESET,
-	GWMC_OPC_DISABLE,
-	GWMC_OPC_CONFIG,
-	GWMC_OPC_OPERATION,
-};
 #define GWMS_OPS_MASK	GWMC_OPC_OPERATION
 
 #define GWMTIRM_MTIOG	BIT(0)
@@ -784,6 +768,7 @@ enum rswitch_gwca_mode {
 #define GWDCC_DQT		BIT(11)
 #define GWDCC_ETS		BIT(9)
 #define GWDCC_EDE		BIT(8)
+#define GWDCC_OSID(val)		((val & 0x7) << 28)
 
 #define GWMDNC_TXDMN(val)	((val & 0x1f) << 8)
 
@@ -811,11 +796,64 @@ enum rswitch_gwca_mode {
 #define FWPC0_MACHMA	BIT(27)
 #define FWPC0_VLANSA	BIT(28)
 
+#define LTHSLP0NONE (0)
+#define LTHSLP0v4OTHER (1)
+#define LTHSLP0v4UDP (2)
+#define LTHSLP0v4TCP (3)
+#define LTHSLP0v6 (6)
+/* L3 Routing Valid Learn */
+#define LTHRVL (BIT(15))
+/* L3 CPU Mirroring Enable Learn */
+#define LTHCMEL (BIT(21))
+#define LTHTL (BIT(31))
+#define LTHTS (BIT(31))
+#define LTHTIOG (BIT(0))
+#define LTHTR (BIT(1))
+/* L3 Entry Delete */
+#define LTHED (BIT(16))
+
+/* Update TTL */
+#define L23UTTLUL (BIT(16))
+/* Update destination MAC */
+#define L23UMDAUL (BIT(17))
+/* Update source MAC */
+#define L23UMSAUL (BIT(18))
+
+/* C-Tag VID update */
+#define L23UCVIDUL (BIT(19))
+/* C-Tag PCP (prio) update */
+#define L23UCPCPUL (BIT(20))
+
+#define RSWITCH_CTAG_VID(id) (id & 0xfff)
+#define RSWITCH_CTAG_VPRIO(prio) ((prio & 0x7) << 12)
+
+#define FWTWBFVCi(i) (FWTWBFVC0 + ((i) * 0x10))
+#define FWTHBFV0Ci(i) (FWTHBFV0C0 + ((i) * 0x10))
+#define FWTHBFV1Ci(i) (FWTHBFV1C0 + ((i) * 0x10))
+#define FWFOBFV0Ci(i) (FWFOBFV0C0 + ((i) * 0x10))
+#define FWFOBFV1Ci(i) (FWFOBFV1C0 + ((i) * 0x10))
+
+#define FWTWBFCi(i) (FWTWBFC0 + ((i) * 0x10))
+#define FWTHBFCi(i) (FWTHBFC0 + ((i) * 0x10))
+#define FWFOBFCi(i) (FWFOBFC0 + ((i) * 0x10))
+#define FWCFMCij(i, j) (FWCFMC00 + ((i) * 0x40 + (j) * 0x4))
+#define FWCFCi(i) (FWCFC0 + ((i) * 0x40))
+#define SNOOPING_BUS_OFFSET(offset) ((offset) << 16)
+#define TWBFM_VAL(val) ((val) << 8)
+#define TWBFILTER_NUM(i) (2 * (i))
+#define THBFILTER_NUM(i) (2 * (PFL_TWBF_N + i))
+#define FBFILTER_NUM(i) (2 * (PFL_TWBF_N + PFL_THBF_N + i))
+#define TBWFILTER_IDX(i) ((i / 2))
+#define THBFILTER_IDX(i) ((i / 2) - PFL_TWBF_N)
+#define FBFILTER_IDX(i) ((i / 2) - PFL_TWBF_N - PFL_THBF_N)
+#define L3_SLV_DESC_SHIFT (36)
+#define L3_SLV_DESC_MASK (0xFUL << L3_SLV_DESC_SHIFT)
+
 #define FWPC0(i)                (FWPC00 + (i) * 0x10)
 #define FWPC0_DEFAULT	(FWPC0_LTHTA | FWPC0_IP4UE | FWPC0_IP4TE | \
-			 FWPC0_IP4OE | FWPC0_L2SE | FWPC0_IP4EA | \
-			 FWPC0_IPDSA | FWPC0_IPHLA | FWPC0_MACSDA | \
-			 FWPC0_MACHLA |	FWPC0_MACHMA | FWPC0_VLANSA)
+			FWPC0_IP4OE | FWPC0_L2SE | FWPC0_IP4EA | \
+			FWPC0_IPDSA | FWPC0_IPHLA | FWPC0_MACSDA | \
+			FWPC0_MACHLA |	FWPC0_MACHMA | FWPC0_VLANSA)
 
 #define FWPC1(i)                (FWPC10 + (i) * 0x10)
 #define FWPC1_DDE	BIT(0)
@@ -879,191 +917,40 @@ enum rswitch_gwca_mode {
 #define BANK_1F80                               0x1f80
 #define VR_MII_AN_CTRL                          0x0004
 
-/* Descriptors */
-enum RX_DS_CC_BIT {
-	RX_DS	= 0x0fff, /* Data size */
-	RX_TR	= 0x1000, /* Truncation indication */
-	RX_EI	= 0x2000, /* Error indication */
-	RX_PS	= 0xc000, /* Padding selection */
-};
+#define NUM_CHAINS_PER_NDEV	3
 
-enum TX_DS_TAGL_BIT {
-	TX_DS	= 0x0fff, /* Data size */
-	TX_TAGL	= 0xf000, /* Frame tag LSBs */
-};
+#define VLAN_HEADER_SIZE	4
 
-enum DIE_DT {
-	/* Frame data */
-	DT_FSINGLE	= 0x80,
-	DT_FSTART	= 0x90,
-	DT_FMID		= 0xA0,
-	DT_FEND		= 0xB8,
-
-	/* Chain control */
-	DT_LEMPTY	= 0xC0,
-	DT_EEMPTY	= 0xD0,
-	DT_LINKFIX	= 0x00,
-	DT_LINK		= 0xE0,
-	DT_EOS		= 0xF0,
-	/* HW/SW arbitration */
-	DT_FEMPTY	= 0x40,
-	DT_FEMPTY_IS	= 0x10,
-	DT_FEMPTY_IC	= 0x20,
-	DT_FEMPTY_ND	= 0x30,
-	DT_FEMPTY_START	= 0x50,
-	DT_FEMPTY_MID	= 0x60,
-	DT_FEMPTY_END	= 0x70,
-
-	DT_MASK		= 0xF0,
-	DIE		= 0x08,	/* Descriptor Interrupt Enable */
-};
-
-/* For timestamp descriptor in dptrl (Byte 4 to 7) */
-#define TS_DESC_TSUN(dptrl)	((dptrl) & GENMASK(7, 0))
-#define TS_DESC_SPN(dptrl)	(((dptrl) & GENMASK(10, 8)) >> 8)
-#define TS_DESC_DPN(dptrl)	(((dptrl) & GENMASK(17, 16)) >> 16)
-#define TS_DESC_TN(dptrl)	((dptrl) & BIT(24))
-
-struct rswitch_desc {
-	__le16 info_ds;	/* Descriptor size */
-	u8 die_dt;	/* Descriptor interrupt enable and type */
-	__u8  dptrh;	/* Descriptor pointer MSB */
-	__le32 dptrl;	/* Descriptor pointer LSW */
-} __packed;
-
-struct rswitch_ts_desc {
-	__le16 info_ds;	/* Descriptor size */
-	u8 die_dt;	/* Descriptor interrupt enable and type */
-	__u8  dptrh;	/* Descriptor pointer MSB */
-	__le32 dptrl;	/* Descriptor pointer LSW */
-	__le32 ts_nsec;
-	__le32 ts_sec;
-} __packed;
-
-struct rswitch_ext_desc {
-	__le16 info_ds;	/* Descriptor size */
-	u8 die_dt;	/* Descriptor interrupt enable and type */
-	__u8  dptrh;	/* Descriptor pointer MSB */
-	__le32 dptrl;	/* Descriptor pointer LSW */
-	__le64 info1;
-} __packed;
-
-struct rswitch_ext_ts_desc {
-	__le16 info_ds;	/* Descriptor size */
-	u8 die_dt;	/* Descriptor interrupt enable and type */
-	__u8  dptrh;	/* Descriptor pointer MSB */
-	__le32 dptrl;	/* Descriptor pointer LSW */
-	__le64 info1;
-	__le32 ts_nsec;
-	__le32 ts_sec;
-} __packed;
-
-#define DESC_INFO1_FMT		BIT(2)
-#define DESC_INFO1_CSD0_SHIFT	32
-#define DESC_INFO1_CSD1_SHIFT	40
-#define DESC_INFO1_DV_SHIFT	48
-
-struct rswitch_etha {
-	int index;
-	void __iomem *addr;
-	void __iomem *serdes_addr;
-	bool external_phy;
-	struct mii_bus *mii;
-	phy_interface_t phy_interface;
-	u8 mac_addr[MAX_ADDR_LEN];
-	int link;
-	int speed;
-	bool operated;
-};
-
-struct rswitch_gwca_chain {
+struct rswitch_fib_event_work {
+	struct work_struct work;
 	union {
-		struct rswitch_ext_desc *tx_ring;
-		struct rswitch_ext_ts_desc *rx_ring;
-		struct rswitch_ts_desc *ts_ring;
+		struct fib_entry_notifier_info fen_info;
+		struct fib_rule_notifier_info fr_info;
 	};
-
-	/* Common */
-	dma_addr_t ring_dma;
-	u32 num_ring;
-	u32 cur;
-	u32 dirty;
-
-	/* For [rt]x_ring */
-	int index;
-	bool dir_tx;
-	struct sk_buff **skb;
-	struct net_device *ndev;	/* chain to ndev for irq */
-};
-
-struct rswitch_gwca_ts_info {
-	struct sk_buff *skb;
-	struct list_head list;
-
-	int port;
-	u8 tag;
-};
-
-#define RSWITCH_NUM_IRQ_REGS	(RSWITCH_MAX_NUM_CHAINS / BITS_PER_TYPE(u32))
-struct rswitch_gwca {
-	int index;
-	struct rswitch_gwca_chain *chains;
-	int num_chains;
-	struct rswitch_gwca_chain ts_queue;
-	struct list_head ts_info_list;
-	DECLARE_BITMAP(used, RSWITCH_MAX_NUM_CHAINS);
-	u32 tx_irq_bits[RSWITCH_NUM_IRQ_REGS];
-	u32 rx_irq_bits[RSWITCH_NUM_IRQ_REGS];
-	int speed;
-};
-
-#define NUM_CHAINS_PER_NDEV	2
-struct rswitch_device {
 	struct rswitch_private *priv;
-	struct net_device *ndev;
-	struct napi_struct napi;
-	void __iomem *addr;
-	struct rswitch_gwca_chain *tx_chain;
-	struct rswitch_gwca_chain *rx_chain;
-	spinlock_t lock;
-	u8 ts_tag;
-
-	int port;
-	struct rswitch_etha *etha;
+	unsigned long event;
 };
 
-struct rswitch_mfwd_mac_table_entry {
-	int chain_index;
-	unsigned char addr[MAX_ADDR_LEN];
+struct rswitch_forward_work {
+	struct work_struct work;
+	struct rswitch_private *priv;
+	u32 src_ip;
+	u32 dst_ip;
 };
 
-struct rswitch_mfwd {
-	struct rswitch_mac_table_entry *mac_table_entries;
-	int num_mac_table_entries;
+struct l3_ipv4_fwd_param_list {
+	struct l3_ipv4_fwd_param *param;
+	struct list_head list;
 };
 
-struct rswitch_private {
-	struct platform_device *pdev;
-	void __iomem *addr;
-	void __iomem *serdes_addr;
-	struct rtsn_ptp_private *ptp_priv;
-	struct rswitch_desc *desc_bat;
-	dma_addr_t desc_bat_dma;
-	u32 desc_bat_size;
-
-	struct rswitch_device *rdev[RSWITCH_MAX_NUM_NDEV];
-
-	struct rswitch_gwca gwca;
-	struct rswitch_etha etha[RSWITCH_MAX_NUM_ETHA];
-	struct rswitch_mfwd mfwd;
-
-	struct clk *rsw_clk;
-	struct clk *phy_clk;
-
-	struct reset_control *sd_rst;
-
-	u8 chan_running;
-	bool serdes_common_init;
+struct rswitch_ipv4_route {
+	u32 ip;
+	u32 subnet;
+	u32 mask;
+	struct fib_nh *nh;
+	struct rswitch_device *rdev;
+	struct list_head param_list;
+	struct list_head list;
 };
 
 static int num_ndev = 3;
@@ -1078,7 +965,26 @@ static bool parallel_mode;
 module_param(parallel_mode, bool, 0644);
 MODULE_PARM_DESC(parallel_mode, "Operate simultaneously with Realtime core");
 
+static int num_virt_devices = 6;
+module_param(num_virt_devices, int, 0644);
+MODULE_PARM_DESC(num_virt_devices, "Number of virtual interfaces");
+
+struct rswitch_net {
+	struct rswitch_private *priv;
+};
+
+static unsigned int rswitch_net_id;
+
 #define RSWITCH_TIMEOUT_MS	1000
+
+/* HACK: store rswitch_priv globally so Xen backend can access it */
+/* TODO: Implement correct way of accessing private data */
+static struct rswitch_private *glob_priv;
+struct rswitch_private *rswitch_find_priv(void)
+{
+	return glob_priv;
+};
+
 static int rswitch_reg_wait(void __iomem *addr, u32 offs, u32 mask, u32 expected)
 {
 	int i;
@@ -1091,6 +997,26 @@ static int rswitch_reg_wait(void __iomem *addr, u32 offs, u32 mask, u32 expected
 	}
 
 	return -ETIMEDOUT;
+}
+
+struct rswitch_device *ndev_to_rdev(const struct net_device *ndev)
+{
+	struct rswitch_private *priv = glob_priv;
+	struct rswitch_device *rdev;
+
+	if (!is_vlan_dev(ndev))
+		return netdev_priv(ndev);
+
+	read_lock(&priv->rdev_list_lock);
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		if (rdev->ndev == ndev) {
+			read_unlock(&priv->rdev_list_lock);
+			return rdev;
+		}
+	}
+	read_unlock(&priv->rdev_list_lock);
+
+	return NULL;
 }
 
 static u32 rswitch_etha_offs(int index)
@@ -1158,7 +1084,7 @@ static void rswitch_get_data_irq_status(struct rswitch_private *priv, u32 *dis)
 		dis[i] = rs_read32(priv->addr + GWDIS0 + i * 0x10);
 }
 
-static void rswitch_enadis_data_irq(struct rswitch_private *priv, int index, bool enable)
+void rswitch_enadis_data_irq(struct rswitch_private *priv, int index, bool enable)
 {
 	u32 offs = (enable ? GWDIE0 : GWDID0) + (index / 32) * 0x10;
 	u32 tmp = 0;
@@ -1168,6 +1094,31 @@ static void rswitch_enadis_data_irq(struct rswitch_private *priv, int index, boo
 		tmp = rs_read32(priv->addr + offs);
 
 	rs_write32(BIT(index % 32) | tmp, priv->addr + offs);
+}
+
+void rswitch_enadis_rdev_irqs(struct rswitch_device *rdev, bool enable)
+{
+	if (!rswitch_is_front_dev(rdev)) {
+		rswitch_enadis_data_irq(rdev->priv, rdev->rx_default_chain->index,
+					enable);
+		if (rdev->rx_learning_chain)
+			rswitch_enadis_data_irq(rdev->priv, rdev->rx_learning_chain->index,
+						enable);
+		rswitch_enadis_data_irq(rdev->priv, rdev->tx_chain->index,
+					enable);
+	} else {
+		if (enable)
+			rswitch_vmq_front_rx_done(rdev);
+	}
+}
+
+void rswitch_trigger_chain(struct rswitch_private *priv,
+			struct rswitch_gwca_chain *chain)
+{
+	if (!rswitch_is_front_priv(priv))
+		rswitch_modify(priv->addr, GWTRC0, 0, BIT(chain->index));
+	else
+		rswitch_vmq_front_trigger_tx(chain->rdev);
 }
 
 static void rswitch_ack_data_irq(struct rswitch_private *priv, int index)
@@ -1191,10 +1142,18 @@ static bool rswitch_is_chain_rxed(struct rswitch_gwca_chain *c, u8 unexpected)
 	return false;
 }
 
-static bool rswitch_rx(struct net_device *ndev, int *quota)
+void rswitch_add_ipv4_forward(struct rswitch_private *priv, u32 src_ip, u32 dst_ip);
+
+static inline bool skb_is_vlan(struct sk_buff *skb)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
-	struct rswitch_gwca_chain *c = rdev->rx_chain;
+	struct vlan_ethhdr *veth = (struct vlan_ethhdr *)skb->data;
+
+	return eth_type_vlan(veth->h_vlan_proto);
+}
+
+static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch_gwca_chain *c, bool learn_chain)
+{
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	int boguscnt = c->dirty + c->num_ring - c->cur;
 	int entry = c->cur % c->num_ring;
 	struct rswitch_ext_ts_desc *desc = &c->rx_ring[entry];
@@ -1213,10 +1172,47 @@ static bool rswitch_rx(struct net_device *ndev, int *quota)
 		if (--boguscnt < 0)
 			break;
 		skb = c->skb[entry];
+
+		if (rdev->mondev) {
+			struct rswitch_private *priv = rdev->priv;
+			int slv;
+
+			slv = ((desc->info1 & L3_SLV_DESC_MASK) >> L3_SLV_DESC_SHIFT);
+			if (slv >= RSWITCH_MAX_RMON_DEV)
+				continue;
+
+			ndev = priv->rmon_dev[slv]->ndev;
+			skb->dev = ndev;
+		}
+
+		if (learn_chain && rdev->priv->offload_enabled) {
+			struct rswitch_private *priv = rdev->priv;
+			struct iphdr *iphdr;
+			struct ethhdr *ethhdr;
+
+			skb_reset_mac_header(skb);
+			skb_reset_network_header(skb);
+
+			ethhdr = (struct ethhdr*)skb_mac_header(skb);
+
+			if (skb_is_vlan(skb))
+				skb_set_network_header(skb, sizeof(*ethhdr) + VLAN_HEADER_SIZE);
+			else
+				skb_set_network_header(skb, sizeof(*ethhdr));
+
+			/* The L2 broadcast packets shouldn't be routed */
+			if (!is_broadcast_ether_addr(ethhdr->h_dest)) {
+				iphdr = ip_hdr(skb);
+				rswitch_add_ipv4_forward(priv, be32_to_cpu(iphdr->saddr),
+							 be32_to_cpu(iphdr->daddr));
+			}
+		}
+
 		c->skb[entry] = NULL;
 		dma_addr = le32_to_cpu(desc->dptrl) | ((__le64)le32_to_cpu(desc->dptrh) << 32);
 		dma_unmap_single(ndev->dev.parent, dma_addr, PKT_BUF_SZ, DMA_FROM_DEVICE);
-		get_ts = rdev->priv->ptp_priv->tstamp_rx_ctrl & RTSN_RXTSTAMP_TYPE_V2_L2_EVENT;
+		if (!rswitch_is_front_dev(rdev))
+			get_ts = rdev->priv->ptp_priv->tstamp_rx_ctrl & RTSN_RXTSTAMP_TYPE_V2_L2_EVENT;
 		if (get_ts) {
 			struct skb_shared_hwtstamps *shhwtstamps;
 			struct timespec64 ts;
@@ -1229,6 +1225,9 @@ static bool rswitch_rx(struct net_device *ndev, int *quota)
 		}
 		skb_put(skb, pkt_len);
 		skb->protocol = eth_type_trans(skb, ndev);
+		// Replace skb dev with real device so vlan_do_receive can work properly
+		if (is_vlan_dev(skb->dev))
+			skb->dev = vlan_dev_real_dev(skb->dev);
 		netif_receive_skb(skb);
 		rdev->ndev->stats.rx_packets++;
 		rdev->ndev->stats.rx_bytes += pkt_len;
@@ -1249,8 +1248,8 @@ static bool rswitch_rx(struct net_device *ndev, int *quota)
 				break;	/* Better luch next round */
 			skb_reserve(skb, NET_IP_ALIGN);
 			dma_addr = dma_map_single(ndev->dev.parent, skb->data,
-						  le16_to_cpu(desc->info_ds),
-						  DMA_FROM_DEVICE);
+						le16_to_cpu(desc->info_ds),
+						DMA_FROM_DEVICE);
 			if (dma_mapping_error(ndev->dev.parent, dma_addr))
 				desc->info_ds = cpu_to_le16(0);
 			desc->dptrl = cpu_to_le32(lower_32_bits(dma_addr));
@@ -1267,9 +1266,27 @@ static bool rswitch_rx(struct net_device *ndev, int *quota)
 	return boguscnt <= 0;
 }
 
-static int rswitch_tx_free(struct net_device *ndev, bool free_txed_only)
+static bool rswitch_rx(struct net_device *ndev, int *quota)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
+	struct rswitch_gwca_chain *default_chain = rdev->rx_default_chain;
+	struct rswitch_gwca_chain *learning_chain = rdev->rx_learning_chain;
+	bool res;
+
+	res = rswitch_rx_chain(ndev, quota, default_chain, false);
+
+	if (res)
+		return res;
+
+	if (learning_chain)
+		res = rswitch_rx_chain(ndev, quota, learning_chain, true);
+
+	return res;
+}
+
+int rswitch_tx_free(struct net_device *ndev, bool free_txed_only)
+{
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	struct rswitch_ext_desc *desc;
 	int free_num = 0;
 	int entry, size;
@@ -1303,11 +1320,10 @@ static int rswitch_tx_free(struct net_device *ndev, bool free_txed_only)
 	return free_num;
 }
 
-static int rswitch_poll(struct napi_struct *napi, int budget)
+int rswitch_poll(struct napi_struct *napi, int budget)
 {
 	struct net_device *ndev = napi->dev;
-	struct rswitch_device *rdev = netdev_priv(ndev);
-	struct rswitch_private *priv = rdev->priv;
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	int quota = budget;
 
 retry:
@@ -1315,7 +1331,9 @@ retry:
 
 	if (rswitch_rx(ndev, &quota))
 		goto out;
-	else if (rswitch_is_chain_rxed(rdev->rx_chain, DT_FEMPTY))
+	else if (rswitch_is_chain_rxed(rdev->rx_default_chain, DT_FEMPTY))
+		goto retry;
+	else if (rdev->rx_learning_chain && rswitch_is_chain_rxed(rdev->rx_learning_chain, DT_FEMPTY))
 		goto retry;
 
 	netif_wake_subqueue(ndev, 0);
@@ -1323,8 +1341,7 @@ retry:
 	napi_complete(napi);
 
 	/* Re-enable RX/TX interrupts */
-	rswitch_enadis_data_irq(priv, rdev->tx_chain->index, true);
-	rswitch_enadis_data_irq(priv, rdev->rx_chain->index, true);
+	rswitch_enadis_rdev_irqs(rdev, true);
 	__iowmb();
 
 out:
@@ -1944,7 +1961,7 @@ static void rswitch_mii_unregister(struct rswitch_device *rdev)
 
 static void rswitch_adjust_link(struct net_device *ndev)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	struct phy_device *phydev = ndev->phydev;
 
 	if (phydev->link != rdev->etha->link) {
@@ -1996,7 +2013,7 @@ static void rswitch_phy_deinit(struct rswitch_device *rdev)
 
 static int rswitch_open(struct net_device *ndev)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	struct device_node *phy;
 	int err = 0;
 	bool phy_started = false;
@@ -2052,13 +2069,19 @@ static int rswitch_open(struct net_device *ndev)
 	netif_start_queue(ndev);
 
 	/* Enable RX */
-	rswitch_modify(rdev->addr, GWTRC0, 0, BIT(rdev->rx_chain->index));
+	if (!rswitch_is_front_dev(rdev)) {
+		rswitch_modify(rdev->addr, GWTRC0, 0, BIT(rdev->rx_default_chain->index));
+		if (rdev->rx_learning_chain)
+			rswitch_modify(rdev->addr, GWTRC0, 0, BIT(rdev->rx_learning_chain->index));
+	}
 
 	/* Enable interrupt */
-	pr_debug("%s: tx = %d, rx = %d\n", __func__, rdev->tx_chain->index, rdev->rx_chain->index);
-	rswitch_enadis_data_irq(rdev->priv, rdev->tx_chain->index, true);
-	rswitch_enadis_data_irq(rdev->priv, rdev->rx_chain->index, true);
-	iowrite32(GWCA_TS_IRQ_BIT, rdev->priv->addr + GWTSDIE);
+	pr_debug("%s: tx = %d, rx = %d\n", __func__, rdev->tx_chain->index, rdev->rx_default_chain->index);
+	rswitch_enadis_rdev_irqs(rdev, true);
+
+	if (!rswitch_is_front_dev(rdev)) {
+		iowrite32(GWCA_TS_IRQ_BIT, rdev->priv->addr + GWTSDIE);
+	}
 
 	rdev->priv->chan_running |= BIT(rdev->port);
 out:
@@ -2075,7 +2098,7 @@ error:
 
 static int rswitch_stop(struct net_device *ndev)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	struct rswitch_gwca_ts_info *ts_info, *ts_info2;
 
 	if (rdev->etha && ndev->phydev)
@@ -2083,24 +2106,85 @@ static int rswitch_stop(struct net_device *ndev)
 
 	napi_disable(&rdev->napi);
 
-	rdev->priv->chan_running &= ~BIT(rdev->port);
-	if (!rdev->priv->chan_running)
-		iowrite32(GWCA_TS_IRQ_BIT, rdev->priv->addr + GWTSDID);
+	if (!rswitch_is_front_dev(rdev)) {
+		rdev->priv->chan_running &= ~BIT(rdev->port);
+		if (!rdev->priv->chan_running)
+			iowrite32(GWCA_TS_IRQ_BIT, rdev->priv->addr + GWTSDID);
 
-	list_for_each_entry_safe(ts_info, ts_info2, &rdev->priv->gwca.ts_info_list, list) {
-		if (ts_info->port != rdev->port)
-			continue;
-		dev_kfree_skb_irq(ts_info->skb);
-		list_del(&ts_info->list);
-		kfree(ts_info);
+		list_for_each_entry_safe(ts_info, ts_info2, &rdev->priv->gwca.ts_info_list, list) {
+			if (ts_info->port != rdev->port)
+				continue;
+			dev_kfree_skb_irq(ts_info->skb);
+			list_del(&ts_info->list);
+			kfree(ts_info);
+		}
 	}
 
 	return 0;
 };
 
+/* Should be called with rswitch_priv->ipv4_forward_lock taken */
+static bool is_l3_exist(struct rswitch_private *priv, u32 src_ip, u32 dst_ip)
+{
+	struct rswitch_device *rdev;
+	struct rswitch_ipv4_route *routing_list;
+	struct l3_ipv4_fwd_param_list *l3_param_list;
+
+	read_lock(&priv->rdev_list_lock);
+	list_for_each_entry(rdev, &priv->rdev_list, list)
+		list_for_each_entry(routing_list, &rdev->routing_list, list)
+			list_for_each_entry(l3_param_list, &routing_list->param_list, list) {
+				if (l3_param_list->param->src_ip == src_ip &&
+							l3_param_list->param->dst_ip == dst_ip) {
+					read_unlock(&priv->rdev_list_lock);
+					return true;
+				}
+			}
+	read_unlock(&priv->rdev_list_lock);
+
+	return false;
+}
+
+static struct rswitch_device *get_dev_by_ip(struct rswitch_private *priv, u32 ip_search, bool use_mask)
+{
+	struct in_device *ip;
+	struct in_ifaddr *in;
+	struct rswitch_device *rdev;
+	u32 ip_addr, mask;
+
+	read_lock(&priv->rdev_list_lock);
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		ip = rdev->ndev->ip_ptr;
+		if (ip == NULL)
+			continue;
+
+		in = ip->ifa_list;
+		while (in != NULL) {
+			memcpy(&ip_addr, &in->ifa_address, 4);
+			memcpy(&mask, &in->ifa_mask, 4);
+			ip_addr = be32_to_cpu(ip_addr);
+			mask = be32_to_cpu(mask);
+			in = in->ifa_next;
+
+			if (use_mask && (ip_search & mask) == (ip_addr & mask)) {
+				read_unlock(&priv->rdev_list_lock);
+				return rdev;
+			}
+
+			if (ip_search == ip_addr) {
+				read_unlock(&priv->rdev_list_lock);
+				return rdev;
+			}
+		}
+	}
+	read_unlock(&priv->rdev_list_lock);
+
+	return NULL;
+}
+
 static int rswitch_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	int ret = NETDEV_TX_OK;
 	int entry;
 	dma_addr_t dma_addr;
@@ -2130,8 +2214,11 @@ static int rswitch_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	desc->dptrh = cpu_to_le32(upper_32_bits(dma_addr));
 	desc->info_ds = cpu_to_le16(skb->len);
 
-	if (!parallel_mode)
-		desc->info1 = (BIT(rdev->etha->index) << 48) | BIT(2);
+	if (!parallel_mode) {
+		if (rdev->etha != NULL) {
+			desc->info1 = (BIT(rdev->etha->index) << 48) | BIT(2);
+		}
+	}
 
 	if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) {
 		struct rswitch_gwca_ts_info *ts_info;
@@ -2144,8 +2231,11 @@ static int rswitch_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
 		rdev->ts_tag++;
-		if (!parallel_mode)
-			desc->info1 |= (rdev->ts_tag << 8) | BIT(3);
+		if (!parallel_mode) {
+			if (rdev->etha != NULL) {
+				desc->info1 |= (rdev->ts_tag << 8) | BIT(3);
+			}
+		}
 		else
 			desc->info1 = (rdev->ts_tag << 8) | BIT(3);
 
@@ -2157,12 +2247,16 @@ static int rswitch_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		skb_tx_timestamp(skb);
 	}
 
+	if (!parallel_mode)
+		desc->info1 |= ((u64)rdev->remote_chain << 40) |
+					((BIT(rdev->port)) << 48) |  BIT(2);
+
 	dma_wmb();
 
 	desc->die_dt = DT_FSINGLE | DIE;
 
 	c->cur++;
-	rswitch_modify(rdev->addr, GWTRC0, 0, BIT(c->index));
+	rswitch_trigger_chain(rdev->priv, c);
 
 out:
 	spin_unlock_irqrestore(&rdev->lock, flags);
@@ -2182,7 +2276,7 @@ static struct net_device_stats *rswitch_get_stats(struct net_device *ndev)
 
 static int rswitch_hwstamp_get(struct net_device *ndev, struct ifreq *req)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	struct rswitch_private *priv = rdev->priv;
 	struct rtsn_ptp_private *ptp_priv = priv->ptp_priv;
 	struct hwtstamp_config config;
@@ -2205,9 +2299,356 @@ static int rswitch_hwstamp_get(struct net_device *ndev, struct ifreq *req)
 	return copy_to_user(req->ifr_data, &config, sizeof(config)) ? -EFAULT : 0;
 }
 
+LIST_HEAD(rswitch_block_cb_list);
+
+static int rswitch_setup_l23_update(struct l23_update_info *l23_info)
+{
+	u32 url1_val = 0, url2_val = 0, url3_val = 0;
+	if (l23_info->update_ttl)
+		url1_val |= L23UTTLUL;
+	if (l23_info->update_src_mac)
+		url1_val |= L23UMSAUL;
+
+	if (l23_info->update_dst_mac) {
+		url1_val |= L23UMDAUL;
+		url1_val |= l23_info->dst_mac[0] << 8 | l23_info->dst_mac[1];
+		url2_val = l23_info->dst_mac[2] << 24 | l23_info->dst_mac[3] << 16 |
+					l23_info->dst_mac[4] << 8 | l23_info->dst_mac[5];
+	}
+
+	if (l23_info->update_ctag_vlan_id) {
+		url1_val |= L23UCVIDUL;
+		url3_val |= RSWITCH_CTAG_VID(l23_info->vlan_id);
+	}
+	if (l23_info->update_ctag_vlan_prio) {
+		url1_val |= L23UCPCPUL;
+		url3_val |= RSWITCH_CTAG_VPRIO(l23_info->vlan_prio);
+	}
+
+	rs_write32(l23_info->routing_number | l23_info->routing_port_valid << 16, l23_info->priv->addr + FWL23URL0);
+	rs_write32(url1_val, l23_info->priv->addr + FWL23URL1);
+	rs_write32(url2_val, l23_info->priv->addr + FWL23URL2);
+	rs_write32(url3_val, l23_info->priv->addr + FWL23URL3);
+
+	return rs_read32(l23_info->priv->addr + FWL23URLR);
+}
+
+static int rswitch_modify_l3fwd(struct l3_ipv4_fwd_param *param, bool delete)
+{
+	struct rswitch_private *priv = param->priv;
+
+	if (!delete) {
+		if (param->l23_info.update_dst_mac || param->l23_info.update_src_mac ||
+					param->l23_info.update_ttl || param->l23_info.update_ctag_vlan_id ||
+					param->l23_info.update_ctag_vlan_prio) {
+			rswitch_setup_l23_update(&param->l23_info);
+		}
+	}
+
+	if (delete)
+		rs_write32(param->frame_type | LTHED, priv->addr + FWLTHTL0);
+	else
+		rs_write32(param->frame_type, priv->addr + FWLTHTL0);
+
+	rs_write32(0, priv->addr + FWLTHTL1);
+	rs_write32(0, priv->addr + FWLTHTL2);
+	rs_write32(param->src_ip, priv->addr + FWLTHTL3);
+	rs_write32(param->dst_ip, priv->addr + FWLTHTL4);
+
+	rs_write32(0, priv->addr + FWLTHTL5);
+	rs_write32(0, priv->addr + FWLTHTL6);
+	rs_write32(param->l23_info.routing_number | LTHRVL | param->slv << 16, priv->addr + FWLTHTL7);
+	if (param->enable_sub_dst)
+		rs_write32(param->csd, priv->addr + FWLTHTL80 + 4 * RSWITCH_HW_NUM_TO_GWCA_IDX(priv->gwca.index));
+	else
+		rs_write32(0, priv->addr + FWLTHTL80 + 4 * RSWITCH_HW_NUM_TO_GWCA_IDX(priv->gwca.index));
+
+	/* Do not mirror traffic, that will be transferred to GWCA,
+	 * because it will be handled by acquiring from the endpoint
+	 * interface.
+	 */
+	if (param->dv != BIT(priv->gwca.index))
+		rs_write32(param->dv | LTHCMEL, priv->addr + FWLTHTL9);
+	else
+		rs_write32(param->dv, priv->addr + FWLTHTL9);
+
+	return rswitch_reg_wait(priv->addr, FWLTHTLR, LTHTL, 0);
+}
+
+int rswitch_add_l3fwd(struct l3_ipv4_fwd_param *param)
+{
+	return rswitch_modify_l3fwd(param, false);
+}
+
+static enum pf_type rswitch_get_pf_type_by_num(int num)
+{
+	if (num >= FBFILTER_NUM(0))
+		return PF_FOUR_BYTE;
+	if (num >= THBFILTER_NUM(0))
+		return PF_THREE_BYTE;
+	return PF_TWO_BYTE;
+}
+
+void rswitch_put_pf(struct l3_ipv4_fwd_param *param)
+{
+	int i, idx, pf_used = 0;
+	enum pf_type type;
+	u32 pf_nums[MAX_PF_ENTRIES] = {0};
+
+	/* First, need to remember used perfect filter nums before cascade filter reset */
+	for (i = 0; i < MAX_PF_ENTRIES; i++) {
+		u32 pf_num = rs_read32(param->priv->addr + FWCFMCij(param->pf_cascade_index, i)) & 0xff;
+
+		if (pf_num) {
+			pf_nums[pf_used] = pf_num;
+			pf_used++;
+		}
+	}
+
+	/* Disable and free cascade filter */
+	rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWCFCi(param->pf_cascade_index));
+	clear_bit(param->pf_cascade_index, param->priv->filters.cascade);
+
+	/* Free all used perfect filters */
+	for (i = 0; i < pf_used; i++) {
+		type = rswitch_get_pf_type_by_num(pf_nums[i]);
+		if (type == PF_TWO_BYTE) {
+			idx = TBWFILTER_IDX(pf_nums[i]);
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWTWBFVCi(idx));
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWTWBFCi(idx));
+			clear_bit(idx, param->priv->filters.two_bytes);
+		} else if (type == PF_THREE_BYTE) {
+			idx = THBFILTER_IDX(pf_nums[i]);
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWTHBFV0Ci(idx));
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWTHBFV1Ci(idx));
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWTHBFCi(idx));
+			clear_bit(idx, param->priv->filters.three_bytes);
+		} else if (type == PF_FOUR_BYTE) {
+			idx = FBFILTER_IDX(pf_nums[i]);
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWFOBFV0Ci(idx));
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWFOBFV1Ci(idx));
+			rs_write32(RSWITCH_PF_DISABLE_FILTER, param->priv->addr + FWFOBFCi(idx));
+			clear_bit(idx, param->priv->filters.four_bytes);
+		}
+	}
+}
+
+int rswitch_remove_l3fwd(struct l3_ipv4_fwd_param *param)
+{
+	clear_bit(param->l23_info.routing_number, param->priv->l23_routing_number);
+
+	/* Using Perfect filter, reset it */
+	if (param->frame_type == LTHSLP0NONE)
+		rswitch_put_pf(param);
+
+	return rswitch_modify_l3fwd(param, true);
+}
+
+static int rswitch_get_pf_config(struct rswitch_private *priv, struct rswitch_pf_entry *entry)
+{
+	if (entry->type == PF_TWO_BYTE) {
+		entry->pf_idx = get_two_byte_filter(priv);
+	} else if (entry->type == PF_THREE_BYTE) {
+		entry->pf_idx = get_three_byte_filter(priv);
+	} else if (entry->type == PF_FOUR_BYTE) {
+		entry->pf_idx = get_four_byte_filter(priv);
+	} else {
+		return -1;
+	}
+
+	if (entry->pf_idx < 0) {
+		return -1;
+	}
+
+	if (entry->type == PF_TWO_BYTE) {
+		entry->cfg0_addr = priv->addr + FWTWBFVCi(entry->pf_idx);
+		/* There is no second config register for Two-Byte filter */
+		entry->cfg1_addr = 0;
+		entry->offs_addr = priv->addr + FWTWBFCi(entry->pf_idx);
+		entry->pf_num = TWBFILTER_NUM(entry->pf_idx);
+		set_bit(entry->pf_idx, priv->filters.two_bytes);
+		return entry->pf_idx;
+	} else if (entry->type == PF_THREE_BYTE) {
+		entry->cfg0_addr = priv->addr + FWTHBFV0Ci(entry->pf_idx);
+		entry->cfg1_addr = priv->addr + FWTHBFV1Ci(entry->pf_idx);
+		entry->offs_addr = priv->addr + FWTHBFCi(entry->pf_idx);
+		entry->pf_num = THBFILTER_NUM(entry->pf_idx);
+		set_bit(entry->pf_idx, priv->filters.three_bytes);
+		return entry->pf_idx;
+	} else {
+		entry->cfg0_addr = priv->addr + FWFOBFV0Ci(entry->pf_idx);
+		entry->cfg1_addr = priv->addr + FWFOBFV1Ci(entry->pf_idx);
+		entry->offs_addr = priv->addr + FWFOBFCi(entry->pf_idx);
+		entry->pf_num = FBFILTER_NUM(entry->pf_idx);
+		set_bit(entry->pf_idx, priv->filters.four_bytes);
+		return entry->pf_idx;
+	}
+}
+
+int rswitch_setup_pf(struct rswitch_pf_param *pf_param)
+{
+	int cascade_idx, i, filters_cnt = 0;
+	struct rswitch_device *rdev = pf_param->rdev;
+	struct rswitch_private *priv = rdev->priv;
+
+	cascade_idx = find_first_zero_bit(priv->filters.cascade, PFL_CADF_N);
+
+	if (cascade_idx == PFL_CADF_N)
+		return -1;
+
+	if (pf_param->used_entries > MAX_PF_ENTRIES)
+		return -1;
+
+	rs_write32(RSWITCH_PF_DISABLE_FILTER, priv->addr + FWCFCi(cascade_idx));
+
+	for (i = 0; i < pf_param->used_entries; i++) {
+		u32 val0, val1, cfg_val;
+
+		/*
+		 * Perfect filter uses two values for configuration:
+		 * - in mask mode: val0 - compared value, val1 - reversed mask
+		 * - in expand and precise modes: val0, val1 - compared values
+		 */
+		val0 = pf_param->entries[i].val;
+		if (pf_param->entries[i].match_mode == RSWITCH_PF_MASK_MODE) {
+			val1 = ~(pf_param->entries[i].mask);
+		} else {
+			val1 = pf_param->entries[i].ext_val;
+		}
+
+		cfg_val = pf_param->entries[i].match_mode;
+		cfg_val |= SNOOPING_BUS_OFFSET(pf_param->entries[i].off);
+
+		if (rswitch_get_pf_config(priv, &pf_param->entries[i]) < 0)
+			goto put_pfs;
+
+		filters_cnt++;
+
+		/* There is no second config register for Two-Byte filter */
+		if (pf_param->entries[i].type == PF_TWO_BYTE) {
+			rs_write32(((u16) val0) | (((u16) val1) << 16),
+						pf_param->entries[i].cfg0_addr);
+
+			cfg_val |= TWBFM_VAL(pf_param->entries[i].filtering_mode);
+		} else {
+			rs_write32(val0, pf_param->entries[i].cfg0_addr);
+			rs_write32(val1, pf_param->entries[i].cfg1_addr);
+		}
+
+		rs_write32(cfg_val, pf_param->entries[i].offs_addr);
+		rs_write32(pf_param->entries[i].pf_num | RSWITCH_PF_ENABLE_FILTER,
+					priv->addr + FWCFMCij(cascade_idx, i));
+	}
+
+	/*
+	 * HW WA: unfilled cascade filter mapping registers may copy values
+	 * from previous cascade filter, so we need explicitly disable them.
+	 */
+	for (i = pf_param->used_entries; i < MAX_PF_ENTRIES; i++) {
+		rs_write32(RSWITCH_PF_DISABLE_FILTER, priv->addr + FWCFMCij(cascade_idx, i));
+	}
+
+	if (pf_param->all_sources) {
+		rs_write32(0x000f007f, priv->addr + FWCFCi(cascade_idx));
+	} else {
+		rs_write32(0x000f0000 | BIT(rdev->port), priv->addr + FWCFCi(cascade_idx));
+	}
+
+	set_bit(cascade_idx, priv->filters.cascade);
+
+	return cascade_idx;
+
+put_pfs:
+	/* Free all filters, that were taken during failed setup */
+	for (i = 0; i < filters_cnt; i++) {
+		switch (pf_param->entries[i].type) {
+			case PF_TWO_BYTE:
+				rs_write32(RSWITCH_PF_DISABLE_FILTER, pf_param->entries[i].cfg0_addr);
+				rs_write32(RSWITCH_PF_DISABLE_FILTER, pf_param->entries[i].offs_addr);
+				clear_bit(pf_param->entries[i].pf_idx, priv->filters.two_bytes);
+				break;
+			case PF_THREE_BYTE:
+			case PF_FOUR_BYTE:
+				rs_write32(RSWITCH_PF_DISABLE_FILTER, pf_param->entries[i].cfg0_addr);
+				rs_write32(RSWITCH_PF_DISABLE_FILTER, pf_param->entries[i].cfg1_addr);
+				rs_write32(RSWITCH_PF_DISABLE_FILTER, pf_param->entries[i].offs_addr);
+				if (pf_param->entries[i].type == PF_THREE_BYTE) {
+					clear_bit(pf_param->entries[i].pf_idx, priv->filters.three_bytes);
+				} else {
+					clear_bit(pf_param->entries[i].pf_idx, priv->filters.four_bytes);
+				}
+				break;
+			default:
+				break;
+		}
+	}
+
+	return -1;
+}
+
+int rswitch_rn_get(struct rswitch_private *priv)
+{
+	int index;
+
+	index = find_first_zero_bit(priv->l23_routing_number, RSWITCH_MAX_NUM_L23);
+	set_bit(index, priv->l23_routing_number);
+
+	return index;
+}
+
+static int rswitch_setup_tc_block_cb(enum tc_setup_type type,
+			void *type_data,
+			void *cb_priv)
+{
+	struct net_device *ndev = cb_priv;
+
+	switch (type) {
+		case TC_SETUP_CLSU32:
+			return rswitch_setup_tc_cls_u32(ndev, type_data);
+		case TC_SETUP_CLSFLOWER:
+			return rswitch_setup_tc_flower(ndev, type_data);
+		case TC_SETUP_CLSMATCHALL:
+			return rswitch_setup_tc_matchall(ndev, type_data);
+		default:
+			return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int rswitch_setup_tc_block(struct rswitch_device *rdev,
+			struct flow_block_offload *f)
+{
+	f->driver_block_list = &rswitch_block_cb_list;
+
+	switch (f->binder_type) {
+		case FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS:
+			return flow_block_cb_setup_simple(f, &rswitch_block_cb_list,
+						rswitch_setup_tc_block_cb, rdev, rdev->ndev, true);
+		default:
+			return -EOPNOTSUPP;
+	}
+}
+
+static int rswitch_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+			void *type_data)
+{
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
+
+	if (rswitch_is_front_dev(rdev) || parallel_mode)
+		return -EOPNOTSUPP;
+
+	switch (type) {
+		case TC_SETUP_BLOCK:
+			return rswitch_setup_tc_block(rdev, type_data);
+		default:
+			return -EOPNOTSUPP;
+	}
+}
+
 static int rswitch_hwstamp_set(struct net_device *ndev, struct ifreq *req)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	struct rswitch_private *priv = rdev->priv;
 	struct rtsn_ptp_private *ptp_priv = priv->ptp_priv;
 	struct hwtstamp_config config;
@@ -2267,7 +2708,18 @@ static int rswitch_do_ioctl(struct net_device *ndev, struct ifreq *req, int cmd)
 	return 0;
 }
 
-static const struct net_device_ops rswitch_netdev_ops = {
+static int rswitch_port_get_port_parent_id(struct net_device *ndev,
+			struct netdev_phys_item_id *ppid)
+{
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
+
+	ppid->id_len = sizeof(rdev->priv->dev_id);
+	memcpy(&ppid->id, &rdev->priv->dev_id, ppid->id_len);
+
+	return 0;
+}
+
+const struct net_device_ops rswitch_netdev_ops = {
 	.ndo_open = rswitch_open,
 	.ndo_stop = rswitch_stop,
 	.ndo_start_xmit = rswitch_start_xmit,
@@ -2275,12 +2727,277 @@ static const struct net_device_ops rswitch_netdev_ops = {
 	.ndo_do_ioctl = rswitch_do_ioctl,
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_get_port_parent_id = rswitch_port_get_port_parent_id,
+	.ndo_setup_tc           = rswitch_setup_tc,
 //	.ndo_change_mtu = eth_change_mtu,
+};
+
+static int rswitch_add_ipv4_dst_route(struct rswitch_ipv4_route *routing_list, struct rswitch_device *rdev, u32 ip)
+{
+	struct rswitch_private *priv = rdev->priv;
+	struct l3_ipv4_fwd_param_list *param_list;
+	struct rswitch_pf_param pf_param = {0};
+	int ret = 0;
+
+	param_list = kzalloc(sizeof(*param_list), GFP_KERNEL);
+	if (!param_list)
+		return -ENOMEM;
+
+	param_list->param = kzalloc(sizeof(struct l3_ipv4_fwd_param), GFP_KERNEL);
+	if (!param_list->param) {
+		ret = -ENOMEM;
+		goto free_param_list;
+	}
+
+	pf_param.rdev = rdev;
+	pf_param.all_sources = true;
+
+	/* Match only packets with IPv4 EtherType */
+	ret = rswitch_init_mask_pf_entry(&pf_param, PF_TWO_BYTE,
+				ETH_P_IP, 0xffff, RSWITCH_IP_VERSION_OFFSET);
+	if (ret)
+		goto free_param_list;
+
+	/* Set destination IP matching */
+	ret = rswitch_init_mask_pf_entry(&pf_param, PF_FOUR_BYTE,
+				ip, 0xffffffff, RSWITCH_IPV4_DST_OFFSET);
+	if (ret)
+		goto free_param_list;
+
+	param_list->param->pf_cascade_index = rswitch_setup_pf(&pf_param);
+	if (param_list->param->pf_cascade_index < 0)
+		goto free_param;
+	param_list->param->priv = priv;
+	param_list->param->dv = BIT(priv->gwca.index);
+	param_list->param->slv = 0x3F;
+	param_list->param->csd = rdev->rx_default_chain->index;
+	param_list->param->frame_type = LTHSLP0NONE;
+	param_list->param->enable_sub_dst = true;
+	param_list->param->l23_info.priv = priv;
+	param_list->param->l23_info.update_ttl = true;
+	param_list->param->l23_info.update_dst_mac = true;
+	param_list->param->l23_info.routing_port_valid = 0x3F;
+	param_list->param->l23_info.routing_number = rswitch_rn_get(priv);
+	memcpy(param_list->param->l23_info.dst_mac, rdev->ndev->dev_addr, ETH_ALEN);
+
+	ret = rswitch_add_l3fwd(param_list->param);
+	if (ret)
+		goto put_pf;
+
+	mutex_lock(&priv->ipv4_forward_lock);
+	list_add(&param_list->list, &routing_list->param_list);
+	mutex_unlock(&priv->ipv4_forward_lock);
+
+	return ret;
+
+put_pf:
+	rswitch_put_pf(param_list->param);
+free_param:
+	kfree(param_list->param);
+free_param_list:
+	kfree(param_list);
+	return ret;
+}
+
+static void rswitch_fib_event_add(struct rswitch_fib_event_work *fib_work)
+{
+	struct fib_entry_notifier_info fen = fib_work->fen_info;
+	struct rswitch_ipv4_route *new_routing_list;
+	struct rswitch_device *rdev;
+	struct fib_nh *nh;
+
+	nh = fib_info_nh(fen.fi, 0);
+
+	if (fen.type != RTN_UNICAST)
+		return;
+
+	rdev = get_dev_by_ip(fib_work->priv, be32_to_cpu(nh->nh_saddr), false);
+	/* Do not offload routes, related to VMQs (etha equal to NULL and not vlan device) */
+	if (!rdev || (!rdev->etha && !is_vlan_dev(rdev->ndev)))
+		return;
+
+	new_routing_list = kzalloc(sizeof(*new_routing_list), GFP_KERNEL);
+	if (!new_routing_list)
+		return;
+
+	new_routing_list->ip = be32_to_cpu(nh->nh_saddr);
+	new_routing_list->mask = be32_to_cpu(inet_make_mask(fen.dst_len));
+	new_routing_list->subnet = fen.dst;
+	new_routing_list->rdev = rdev;
+	INIT_LIST_HEAD(&new_routing_list->param_list);
+
+	mutex_lock(&rdev->priv->ipv4_forward_lock);
+	list_add(&new_routing_list->list, &rdev->routing_list);
+	mutex_unlock(&rdev->priv->ipv4_forward_lock);
+
+	/*
+	 * Route with zeroed subnet is default route. It does not need a PF entry
+	 * added to MFWD, just need to be added in device routing list.
+	 */
+	if (!new_routing_list->subnet)
+		return;
+
+	if (!rswitch_add_ipv4_dst_route(new_routing_list, rdev, be32_to_cpu(nh->nh_saddr)))
+				nh->fib_nh_flags |= RTNH_F_OFFLOAD;
+	new_routing_list->nh = nh;
+}
+
+static void rswitch_fib_event_remove(struct rswitch_fib_event_work *fib_work)
+{
+	struct fib_entry_notifier_info fen = fib_work->fen_info;
+	struct rswitch_device *rdev;
+	struct fib_nh *nh;
+	struct list_head *cur, *tmp;
+	struct rswitch_ipv4_route *routing_list;
+	struct l3_ipv4_fwd_param_list *param_list;
+	bool route_found = false;
+
+	nh = fib_info_nh(fen.fi, 0);
+
+	if (fen.type != RTN_UNICAST)
+		return;
+
+	rdev = get_dev_by_ip(fib_work->priv, be32_to_cpu(nh->nh_saddr), false);
+	if (!rdev)
+		return;
+
+	mutex_lock(&rdev->priv->ipv4_forward_lock);
+	list_for_each(cur, &rdev->routing_list) {
+		routing_list = list_entry(cur, struct rswitch_ipv4_route, list);
+		if (routing_list->subnet == fen.dst && routing_list->ip == be32_to_cpu(nh->nh_saddr)) {
+			route_found = true;
+			break;
+		}
+	}
+
+	/* There is nothing to free */
+	if (!route_found) {
+		mutex_unlock(&rdev->priv->ipv4_forward_lock);
+		return;
+	}
+
+	list_for_each_safe(cur, tmp, &routing_list->param_list) {
+		param_list = list_entry(cur, struct l3_ipv4_fwd_param_list, list);
+		rswitch_remove_l3fwd(param_list->param);
+		list_del(cur);
+		kfree(param_list->param);
+		kfree(param_list);
+	}
+
+	list_del(&routing_list->list);
+	mutex_unlock(&rdev->priv->ipv4_forward_lock);
+
+	kfree(routing_list);
+}
+
+static void rswitch_fib_event_work(struct work_struct *work)
+{
+	struct rswitch_fib_event_work *fib_work =
+		container_of(work, struct rswitch_fib_event_work, work);
+
+	/* Protect internal structures from changes */
+	rtnl_lock();
+	switch (fib_work->event) {
+		case FIB_EVENT_ENTRY_REPLACE:
+			rswitch_fib_event_add(fib_work);
+			fib_info_put(fib_work->fen_info.fi);
+			break;
+		case FIB_EVENT_ENTRY_DEL:
+			rswitch_fib_event_remove(fib_work);
+			fib_info_put(fib_work->fen_info.fi);
+			break;
+	}
+
+	rtnl_unlock();
+	kfree(fib_work);
+}
+
+/* Called with rcu_read_lock() */
+static int rswitch_fib_event(struct notifier_block *nb,
+			unsigned long event, void *ptr)
+{
+	struct rswitch_private *priv = container_of(nb, struct rswitch_private, fib_nb);
+	struct fib_notifier_info *info = ptr;
+	struct rswitch_fib_event_work *fib_work;
+
+	/* Handle only IPv4 routes */
+	if (info->family != AF_INET)
+		return NOTIFY_DONE;
+
+	fib_work = kzalloc(sizeof(*fib_work), GFP_ATOMIC);
+	if (WARN_ON(!fib_work))
+		return NOTIFY_BAD;
+
+	fib_work->event = event;
+	fib_work->priv = priv;
+
+	INIT_WORK(&fib_work->work, rswitch_fib_event_work);
+
+	switch (event) {
+		case FIB_EVENT_ENTRY_ADD:
+		case FIB_EVENT_ENTRY_APPEND:
+		case FIB_EVENT_ENTRY_DEL:
+		case FIB_EVENT_ENTRY_REPLACE:
+			if (info->family == AF_INET) {
+				struct fib_entry_notifier_info *fen_info = ptr;
+
+				if (fen_info->fi->fib_nh_is_v6) {
+					NL_SET_ERR_MSG_MOD(info->extack, "IPv6 gateway with IPv4 route is not supported");
+					kfree(fib_work);
+					return notifier_from_errno(-EINVAL);
+				}
+				if (fen_info->fi->nh) {
+					NL_SET_ERR_MSG_MOD(info->extack, "IPv4 route with nexthop objects is not supported");
+					kfree(fib_work);
+					return notifier_from_errno(-EINVAL);
+				}
+			}
+
+			memcpy(&fib_work->fen_info, ptr, sizeof(fib_work->fen_info));
+			/* Take referece on fib_info to prevent it from being
+			   +		 * freed while work is queued. Release it afterwards.
+			   +		 */
+			fib_info_hold(fib_work->fen_info.fi);
+			break;
+	}
+
+	queue_work(priv->rswitch_fib_wq, &fib_work->work);
+
+	return NOTIFY_DONE;
+}
+
+static __net_init int rswitch_init_net(struct net *net)
+{
+	struct rswitch_net *rn_init = net_generic(&init_net, rswitch_net_id);
+
+	/* Notifier for initial network is already registered */
+	if (net == &init_net)
+		return 0;
+
+	rn_init->priv->fib_nb.notifier_call = rswitch_fib_event;
+	return register_fib_notifier(net, &rn_init->priv->fib_nb, NULL, NULL);
+}
+
+static void __net_exit rswitch_exit_net(struct net *net)
+{
+	struct rswitch_net *rn_init = net_generic(&init_net, rswitch_net_id);
+
+	if (net == &init_net)
+		return;
+
+	unregister_fib_notifier(net, &rn_init->priv->fib_nb);
+}
+
+struct pernet_operations rswitch_net_ops = {
+	.init = rswitch_init_net,
+	.exit = rswitch_exit_net,
+	.id   = &rswitch_net_id,
+	.size = sizeof(struct rswitch_net),
 };
 
 static int rswitch_get_ts_info(struct net_device *ndev, struct ethtool_ts_info *info)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 
 	info->phc_index = ptp_clock_index(rdev->priv->ptp_priv->clock);
 	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
@@ -2431,23 +3148,25 @@ static int rswitch_gwca_hw_init(struct rswitch_private *priv)
 }
 
 static void rswitch_gwca_chain_free(struct net_device *ndev,
-				    struct rswitch_private *priv,
-				    struct rswitch_gwca_chain *c)
+			struct rswitch_private *priv,
+			struct rswitch_gwca_chain *c)
 {
 	int i;
 
+	if (!c)
+		return;
 	if (!c->dir_tx) {
 		dma_free_coherent(ndev->dev.parent,
-				  sizeof(struct rswitch_ext_ts_desc) *
-				  (c->num_ring + 1), c->rx_ring, c->ring_dma);
+					sizeof(struct rswitch_ext_ts_desc) *
+					(c->num_ring + 1), c->rx_ring, c->ring_dma);
 		c->rx_ring = NULL;
 
 		for (i = 0; i < c->num_ring; i++)
 			dev_kfree_skb(c->skb[i]);
 	} else {
 		dma_free_coherent(ndev->dev.parent,
-				  sizeof(struct rswitch_desc) *
-				  (c->num_ring + 1), c->tx_ring, c->ring_dma);
+					sizeof(struct rswitch_desc) *
+					(c->num_ring + 1), c->tx_ring, c->ring_dma);
 		c->tx_ring = NULL;
 	}
 
@@ -2466,19 +3185,23 @@ static void rswitch_gwca_ts_queue_free(struct rswitch_private *priv)
 }
 
 static int rswitch_gwca_chain_init(struct net_device *ndev,
-				   struct rswitch_private *priv,
-				   struct rswitch_gwca_chain *c,
-				   bool dir_tx, int num_ring)
+			struct rswitch_private *priv,
+			struct rswitch_gwca_chain *c,
+			bool dir_tx, int num_ring)
 {
-	int i, bit;
-	int index = c->index;	/* Keep the index before memset() */
+	int i;
+	int index;	/* Keep the index before memset() */
 	struct sk_buff *skb;
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 
+	if (!c)
+		return 0;
+	index = c->index;
 	memset(c, 0, sizeof(*c));
 	c->index = index;
 	c->dir_tx = dir_tx;
 	c->num_ring = num_ring;
-	c->ndev = ndev;
+	c->rdev = rdev;
 
 	c->skb = kcalloc(c->num_ring, sizeof(*c->skb), GFP_KERNEL);
 	if (!c->skb)
@@ -2493,22 +3216,15 @@ static int rswitch_gwca_chain_init(struct net_device *ndev,
 			c->skb[i] = skb;
 		}
 		c->rx_ring = dma_alloc_coherent(ndev->dev.parent,
-				sizeof(struct rswitch_ext_ts_desc) *
-				(c->num_ring + 1), &c->ring_dma, GFP_KERNEL);
+					sizeof(struct rswitch_ext_ts_desc) *
+					(c->num_ring + 1), &c->ring_dma, GFP_KERNEL);
 	} else {
 		c->tx_ring = dma_alloc_coherent(ndev->dev.parent,
-				sizeof(struct rswitch_ext_desc) *
-				(c->num_ring + 1), &c->ring_dma, GFP_KERNEL);
+					sizeof(struct rswitch_ext_desc) *
+					(c->num_ring + 1), &c->ring_dma, GFP_KERNEL);
 	}
 	if (!c->rx_ring && !c->tx_ring)
 		goto out;
-
-	index = c->index / 32;
-	bit = BIT(c->index % 32);
-	if (dir_tx)
-		priv->gwca.tx_irq_bits[index] |= bit;
-	else
-		priv->gwca.rx_irq_bits[index] |= bit;
 
 	return 0;
 
@@ -2530,12 +3246,42 @@ static int rswitch_gwca_ts_queue_alloc(struct rswitch_private *priv)
 	return !gq->ts_ring ? -ENOMEM : 0;
 }
 
+void rswitch_gwca_chain_register(struct rswitch_private *priv,
+			struct rswitch_gwca_chain *c, bool ts)
+{
+	struct rswitch_desc *desc;
+	int bit;
+	int index;
+
+	desc = &priv->desc_bat[c->index];
+	desc->die_dt = DT_LINKFIX;
+	desc->dptrl = cpu_to_le32(lower_32_bits(c->ring_dma));
+	desc->dptrh = cpu_to_le32(upper_32_bits(c->ring_dma));
+
+	index = c->index / 32;
+	bit = BIT(c->index % 32);
+
+	if (!priv->addr)
+		return;
+
+	if (c->dir_tx)
+		priv->gwca.tx_irq_bits[index] |= bit;
+	else
+		priv->gwca.rx_irq_bits[index] |= bit;
+
+	/* FIXME: GWDCC_DCP */
+	rs_write32(GWDCC_BALR | (c->dir_tx ? GWDCC_DQT : 0) |
+				(ts ? GWDCC_ETS : 0) |
+				GWDCC_EDE |
+				GWDCC_OSID(c->osid),
+				priv->addr + GWDCC_OFFS(c->index));
+}
+
 static int rswitch_gwca_chain_format(struct net_device *ndev,
-				struct rswitch_private *priv,
-				struct rswitch_gwca_chain *c)
+			struct rswitch_private *priv,
+			struct rswitch_gwca_chain *c)
 {
 	struct rswitch_ext_desc *ring;
-	struct rswitch_desc *desc;
 	int tx_ring_size = sizeof(*ring) * c->num_ring;
 	int i;
 	dma_addr_t dma_addr;
@@ -2559,20 +3305,13 @@ static int rswitch_gwca_chain_format(struct net_device *ndev,
 	ring->dptrh = cpu_to_le32(upper_32_bits(c->ring_dma));
 	ring->die_dt = DT_LINKFIX;
 
-	desc = &priv->desc_bat[c->index];
-	desc->die_dt = DT_LINKFIX;
-	desc->dptrl = cpu_to_le32(lower_32_bits(c->ring_dma));
-	desc->dptrh = cpu_to_le32(upper_32_bits(c->ring_dma));
-
-	/* FIXME: GWDCC_DCP */
-	rs_write32(GWDCC_BALR | (c->dir_tx ? GWDCC_DQT : 0) | GWDCC_EDE,
-		   priv->addr + GWDCC_OFFS(c->index));
+	rswitch_gwca_chain_register(priv, c, false);
 
 	return 0;
 }
 
 static void rswitch_gwca_ts_queue_fill(struct rswitch_private *priv,
-				       int start_index, int num)
+			int start_index, int num)
 {
 	struct rswitch_gwca_chain *gq = &priv->gwca.ts_queue;
 	struct rswitch_ts_desc *desc;
@@ -2591,21 +3330,23 @@ static void rswitch_gwca_ts_queue_fill(struct rswitch_private *priv,
 }
 
 static int rswitch_gwca_chain_ext_ts_format(struct net_device *ndev,
-					    struct rswitch_private *priv,
-					    struct rswitch_gwca_chain *c)
+			struct rswitch_private *priv,
+			struct rswitch_gwca_chain *c)
 {
 	struct rswitch_ext_ts_desc *ring;
-	struct rswitch_desc *desc;
-	int ring_size = sizeof(*ring) * c->num_ring;
+	int ring_size;
 	int i;
 	dma_addr_t dma_addr;
 
+	if (!c)
+		return 0;
+	ring_size = sizeof(*ring) * c->num_ring;
 	memset(c->rx_ring, 0, ring_size);
 	for (i = 0, ring = c->rx_ring; i < c->num_ring; i++, ring++) {
 		if (!c->dir_tx) {
 			dma_addr = dma_map_single(ndev->dev.parent,
-					c->skb[i]->data, PKT_BUF_SZ,
-					DMA_FROM_DEVICE);
+						c->skb[i]->data, PKT_BUF_SZ,
+						DMA_FROM_DEVICE);
 			if (!dma_mapping_error(ndev->dev.parent, dma_addr))
 				ring->info_ds = cpu_to_le16(PKT_BUF_SZ);
 			ring->dptrl = cpu_to_le32(lower_32_bits(dma_addr));
@@ -2619,26 +3360,36 @@ static int rswitch_gwca_chain_ext_ts_format(struct net_device *ndev,
 	ring->dptrh = cpu_to_le32(upper_32_bits(c->ring_dma));
 	ring->die_dt = DT_LINKFIX;
 
-	desc = &priv->desc_bat[c->index];
-	desc->die_dt = DT_LINKFIX;
-	desc->dptrl = cpu_to_le32(lower_32_bits(c->ring_dma));
-	desc->dptrh = cpu_to_le32(upper_32_bits(c->ring_dma));
-
-	/* FIXME: GWDCC_DCP */
-	rs_write32(GWDCC_BALR | (c->dir_tx ? GWDCC_DQT : 0) | GWDCC_ETS | GWDCC_EDE,
-		  priv->addr + GWDCC_OFFS(c->index));
+	rswitch_gwca_chain_register(priv, c, true);
 
 	return 0;
 }
 
-static int rswitch_desc_alloc(struct rswitch_private *priv)
+int rswitch_desc_alloc(struct rswitch_private *priv)
 {
 	struct device *dev = &priv->pdev->dev;
 	int i, num_chains = priv->gwca.num_chains;
+	struct resource r;
+	struct device_node *node;
+	int ret;
+
+	node = of_parse_phandle(dev->of_node, "memory-region", 0);
+	if (!node) {
+		dev_err(dev, "no memory-region specified\n");
+		return -EINVAL;
+	}
+
+	ret = of_address_to_resource(node, 0, &r);
+
+	of_node_put(node);
+
+	if (ret)
+		return ret;
 
 	priv->desc_bat_size = sizeof(struct rswitch_desc) * num_chains;
-	priv->desc_bat = dma_alloc_coherent(dev, priv->desc_bat_size,
-					    &priv->desc_bat_dma, GFP_KERNEL);
+	priv->desc_bat_dma = r.start;
+	priv->desc_bat = memremap(r.start, resource_size(&r), MEMREMAP_WB);
+
 	if (!priv->desc_bat)
 		return -ENOMEM;
 	for (i = 0; i < num_chains; i++)
@@ -2647,15 +3398,14 @@ static int rswitch_desc_alloc(struct rswitch_private *priv)
 	return 0;
 }
 
-static void rswitch_desc_free(struct rswitch_private *priv)
+void rswitch_desc_free(struct rswitch_private *priv)
 {
 	if (priv->desc_bat)
-		dma_free_coherent(&priv->pdev->dev, priv->desc_bat_size,
-				  priv->desc_bat, priv->desc_bat_dma);
+		memunmap(priv->desc_bat);
 	priv->desc_bat = NULL;
 }
 
-static struct rswitch_gwca_chain *rswitch_gwca_get(struct rswitch_private *priv)
+struct rswitch_gwca_chain *rswitch_gwca_get(struct rswitch_private *priv)
 {
 	int index;
 
@@ -2668,21 +3418,30 @@ static struct rswitch_gwca_chain *rswitch_gwca_get(struct rswitch_private *priv)
 	return &priv->gwca.chains[index];
 }
 
-static void rswitch_gwca_put(struct rswitch_private *priv,
-			     struct rswitch_gwca_chain *c)
+void rswitch_gwca_put(struct rswitch_private *priv,
+			struct rswitch_gwca_chain *c)
 {
-	clear_bit(c->index, priv->gwca.used);
+	if (c)
+		clear_bit(c->index, priv->gwca.used);
 }
 
-static int rswitch_txdmac_init(struct net_device *ndev,
-			       struct rswitch_private *priv)
+int rswitch_txdmac_init(struct net_device *ndev, struct rswitch_private *priv,
+			int chain_num)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	int err;
 
-	rdev->tx_chain = rswitch_gwca_get(priv);
-	if (!rdev->tx_chain)
-		return -EBUSY;
+	if (chain_num < 0) {
+		rdev->tx_chain = rswitch_gwca_get(priv);
+		if (!rdev->tx_chain)
+			return -EBUSY;
+	} else {
+		rdev->tx_chain = devm_kzalloc(ndev->dev.parent, sizeof(*rdev->tx_chain),
+					GFP_KERNEL);
+		if (!rdev->tx_chain)
+			return -ENOMEM;
+		rdev->tx_chain->index = chain_num;
+	}
 
 	err = rswitch_gwca_chain_init(ndev, priv, rdev->tx_chain, true, TX_RING_SIZE);
 	if (err < 0)
@@ -2698,56 +3457,82 @@ out_format:
 	rswitch_gwca_chain_free(ndev, priv, rdev->tx_chain);
 
 out_init:
-	rswitch_gwca_put(priv, rdev->tx_chain);
+	if (priv)
+		rswitch_gwca_put(priv, rdev->tx_chain);
 
 	return err;
 }
 
-static void rswitch_txdmac_free(struct net_device *ndev,
-				struct rswitch_private *priv)
+void rswitch_txdmac_free(struct net_device *ndev,
+			struct rswitch_private *priv)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 
 	rswitch_gwca_chain_free(ndev, priv, rdev->tx_chain);
 	rswitch_gwca_put(priv, rdev->tx_chain);
 }
 
-static int rswitch_rxdmac_init(struct net_device *ndev,
-			       struct rswitch_private *priv)
+int rswitch_rxdmac_init(struct net_device *ndev, struct rswitch_private *priv,
+			int chain_num)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	int err;
 
-	rdev->rx_chain = rswitch_gwca_get(priv);
-	if (!rdev->rx_chain)
-		return -EBUSY;
+	if (chain_num < 0) {
+		rdev->rx_default_chain = rswitch_gwca_get(priv);
+		if (!rdev->rx_default_chain)
+			return -EBUSY;
+		if (!parallel_mode) {
+			rdev->rx_learning_chain = rswitch_gwca_get(priv);
+			if (!rdev->rx_learning_chain)
+				goto put_default;
+		}
+	} else {
+		rdev->rx_default_chain = devm_kzalloc(ndev->dev.parent,
+					sizeof(*rdev->rx_default_chain),
+					GFP_KERNEL);
+		if (!rdev->rx_default_chain)
+			return -ENOMEM;
+		rdev->rx_default_chain->index = chain_num;
+		/* TODO need to init rdev->rx_learning_chain */
+	}
 
-	err = rswitch_gwca_chain_init(ndev, priv, rdev->rx_chain, false, RX_RING_SIZE);
+	err = rswitch_gwca_chain_init(ndev, priv, rdev->rx_default_chain, false, RX_RING_SIZE);
 	if (err < 0)
-		goto out_init;
+		goto put_learning;
+	err = rswitch_gwca_chain_init(ndev, priv, rdev->rx_learning_chain, false, RX_RING_SIZE);
+	if (err < 0)
+		goto free_default;
 
-	err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_chain);
+	err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_default_chain);
 	if (err < 0)
-		goto out_format;
+		goto free_learning;
+	err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_learning_chain);
+	if (err < 0)
+		goto free_learning;
 
 	return 0;
 
-out_format:
-	rswitch_gwca_chain_free(ndev, priv, rdev->rx_chain);
-
-out_init:
-	rswitch_gwca_put(priv, rdev->rx_chain);
+free_learning:
+	rswitch_gwca_chain_free(ndev, priv, rdev->rx_learning_chain);
+free_default:
+	rswitch_gwca_chain_free(ndev, priv, rdev->rx_default_chain);
+put_learning:
+	rswitch_gwca_put(priv, rdev->rx_learning_chain);
+put_default:
+	rswitch_gwca_put(priv, rdev->rx_default_chain);
 
 	return err;
 }
 
-static void rswitch_rxdmac_free(struct net_device *ndev,
-				struct rswitch_private *priv)
+void rswitch_rxdmac_free(struct net_device *ndev, struct rswitch_private *priv)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 
-	rswitch_gwca_chain_free(ndev, priv, rdev->rx_chain);
-	rswitch_gwca_put(priv, rdev->rx_chain);
+	rswitch_gwca_chain_free(ndev, priv, rdev->rx_default_chain);
+	rswitch_gwca_chain_free(ndev, priv, rdev->rx_learning_chain);
+	rswitch_gwca_put(priv, rdev->rx_default_chain);
+	rswitch_gwca_put(priv, rdev->rx_learning_chain);
 }
 
 static void rswitch_set_mac_address(struct rswitch_device *rdev)
@@ -2778,7 +3563,7 @@ static void rswitch_set_mac_address(struct rswitch_device *rdev)
 	of_node_put(ports);
 }
 
-static int rswitch_ndev_create(struct rswitch_private *priv, int index)
+static int rswitch_ndev_create(struct rswitch_private *priv, int index, bool rmon_dev)
 {
 	struct platform_device *pdev = priv->pdev;
 	struct net_device *ndev;
@@ -2795,15 +3580,28 @@ static int rswitch_ndev_create(struct rswitch_private *priv, int index)
 	rdev = netdev_priv(ndev);
 	rdev->ndev = ndev;
 	rdev->priv = priv;
-	priv->rdev[index] = rdev;
+	INIT_LIST_HEAD(&rdev->routing_list);
+	INIT_LIST_HEAD(&rdev->tc_u32_list);
+	INIT_LIST_HEAD(&rdev->tc_matchall_list);
+	INIT_LIST_HEAD(&rdev->tc_flower_list);
+	INIT_LIST_HEAD(&rdev->list);
+	if (!rmon_dev) {
+		read_lock(&priv->rdev_list_lock);
+		list_add_tail(&rdev->list, &priv->rdev_list);
+		read_unlock(&priv->rdev_list_lock);
+	} else {
+		priv->rmon_dev[index] = rdev;
+	}
+
 	/* TODO: netdev instance : ETHA port is 1:1 mapping */
-	if (index < RSWITCH_MAX_NUM_ETHA) {
+	if (index < RSWITCH_MAX_NUM_ETHA && !rmon_dev) {
 		rdev->port = index;
 		rdev->etha = &priv->etha[index];
 	} else {
 		rdev->port = -1;
 		rdev->etha = NULL;
 	}
+	rdev->remote_chain = 0;
 	rdev->addr = priv->addr;
 
 	spin_lock_init(&rdev->lock);
@@ -2811,25 +3609,55 @@ static int rswitch_ndev_create(struct rswitch_private *priv, int index)
 	ndev->features = NETIF_F_RXCSUM;
 	ndev->hw_features = NETIF_F_RXCSUM;
 	ndev->base_addr = (unsigned long)rdev->addr;
-	snprintf(ndev->name, IFNAMSIZ, "tsn%d", index);
+	if (!rmon_dev) {
+		snprintf(ndev->name, IFNAMSIZ, "tsn%d", index);
+		ndev->ethtool_ops = &rswitch_ethtool_ops;
+		rswitch_set_mac_address(rdev);
+		rdev->mondev = false;
+	} else {
+		snprintf(ndev->name, IFNAMSIZ, "rmon%d", index);
+		eth_hw_addr_random(ndev);
+		rdev->mondev = true;
+	}
 	ndev->netdev_ops = &rswitch_netdev_ops;
-	ndev->ethtool_ops = &rswitch_ethtool_ops;
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
 
-	rswitch_set_mac_address(rdev);
-
 	/* FIXME: it seems S4 VPF has FWPBFCSDC0/1 only so that we cannot set
-	 * CSD = 1 (rx_chain->index = 1) for FWPBFCS03. So, use index = 0
+	 * CSD = 1 (rx_default_chain->index = 1) for FWPBFCS03. So, use index = 0
 	 * for the RX.
 	 */
-	err = rswitch_rxdmac_init(ndev, priv);
-	if (err < 0)
-		goto out_rxdmac;
+	if (!rmon_dev) {
+		err = rswitch_rxdmac_init(ndev, priv, -1);
+		if (err < 0)
+			goto out_rxdmac;
 
-	err = rswitch_txdmac_init(ndev, priv);
-	if (err < 0)
-		goto out_txdmac;
+		err = rswitch_txdmac_init(ndev, priv, -1);
+		if (err < 0)
+			goto out_txdmac;
+	} else {
+		/* All rmon devices use the same chains because
+		 * CPU mirroring can mirror traffic only to one
+		 * sub-destination. The traffic will be forwarded
+		 * to appropriate netdevs in rswitch_rx function
+		 * according to source lock vector stored in info1.
+		 */
+		if (!priv->mon_rx_chain || !priv->mon_tx_chain) {
+			err = rswitch_rxdmac_init(ndev, priv, -1);
+			if (err < 0)
+				goto out_rxdmac;
+
+			err = rswitch_txdmac_init(ndev, priv, -1);
+			if (err < 0)
+				goto out_txdmac;
+
+			priv->mon_rx_chain = rdev->rx_default_chain;
+			priv->mon_tx_chain = rdev->tx_chain;
+		} else {
+			rdev->rx_default_chain = priv->mon_rx_chain;
+			rdev->tx_chain = priv->mon_tx_chain;
+		}
+	}
 
 	/* Print device information */
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
@@ -2846,16 +3674,22 @@ out_rxdmac:
 	return err;
 }
 
-static void rswitch_ndev_unregister(struct rswitch_private *priv, int index)
+void rswitch_ndev_unregister(struct rswitch_device *rdev, int index)
 {
-	struct rswitch_device *rdev = priv->rdev[index];
 	struct net_device *ndev = rdev->ndev;
+	struct rswitch_private *priv = rdev->priv;
 
 	rswitch_txdmac_free(ndev, priv);
 	rswitch_rxdmac_free(ndev, priv);
 	unregister_netdev(ndev);
 	netif_napi_del(&rdev->napi);
-	free_netdev(ndev);
+	if (!rdev->mondev) {
+		list_del(&rdev->list);
+		free_netdev(ndev);
+	} else {
+		free_netdev(ndev);
+		priv->rmon_dev[index] = NULL;
+	}
 }
 
 static int rswitch_bpool_config(struct rswitch_private *priv)
@@ -2870,14 +3704,33 @@ static int rswitch_bpool_config(struct rswitch_private *priv)
 	return rswitch_reg_wait(priv->addr, CABPIRM, CABPIRM_BPR, CABPIRM_BPR);
 }
 
-static void rswitch_queue_interrupt(struct net_device *ndev)
+static void rswitch_queue_interrupt(struct rswitch_device *rdev)
 {
-	struct rswitch_device *rdev = netdev_priv(ndev);
+	if (!rdev->mondev) {
+		if (napi_schedule_prep(&rdev->napi)) {
+			rswitch_enadis_data_irq(rdev->priv, rdev->tx_chain->index, false);
+			rswitch_enadis_data_irq(rdev->priv, rdev->rx_default_chain->index, false);
+			if (rdev->rx_learning_chain) {
+				rswitch_enadis_data_irq(rdev->priv,
+							rdev->rx_learning_chain->index, false);
+			}
+			__napi_schedule(&rdev->napi);
+		}
+	} else {
+		struct rswitch_private *priv = rdev->priv;
+		int i;
 
-	if (napi_schedule_prep(&rdev->napi)) {
-		rswitch_enadis_data_irq(rdev->priv, rdev->tx_chain->index, false);
-		rswitch_enadis_data_irq(rdev->priv, rdev->rx_chain->index, false);
-		__napi_schedule(&rdev->napi);
+		/* Schedule napi for all rmon devices as
+		 * they share the same chain.
+		 */
+		for (i = 0; i < RSWITCH_MAX_RMON_DEV; i++) {
+			if (priv->rmon_dev[i] && napi_schedule_prep(&priv->rmon_dev[i]->napi)) {
+				rswitch_enadis_data_irq(priv->rmon_dev[i]->priv,
+							priv->rmon_dev[i]->rx_default_chain->index,
+							false);
+				__napi_schedule(&priv->rmon_dev[i]->napi);
+			}
+		}
 	}
 }
 
@@ -2887,15 +3740,18 @@ static irqreturn_t __maybe_unused rswitch_data_irq(struct rswitch_private *priv,
 	int i;
 	int index, bit;
 
-	for (i = 0; i < priv->gwca.num_chains; i++) {
+	for_each_set_bit(i, priv->gwca.used, priv->gwca.num_chains) {
 		c = &priv->gwca.chains[i];
 		index = c->index / 32;
 		bit = BIT(c->index % 32);
-		if (!(dis[index] & bit))
+		if (!(dis[index] & bit) || !(test_bit(i, priv->gwca.used)))
 			continue;
 
 		rswitch_ack_data_irq(priv, c->index);
-		rswitch_queue_interrupt(c->ndev);
+		if (!c->back_info)
+			rswitch_queue_interrupt(c->rdev);
+		else
+			rswitch_vmq_back_data_irq(c);
 	}
 
 	return IRQ_HANDLED;
@@ -3017,10 +3873,207 @@ static int rswitch_gwca_ts_request_irqs(struct rswitch_private *priv)
 				0, GWCA_TS_IRQ_NAME, priv);
 }
 
+static int rswitch_ipv4_resolve(struct rswitch_device *rdev, u32 ip, u8 mac[ETH_ALEN])
+{
+	__be32 be_ip = cpu_to_be32(ip);
+	struct net_device *ndev = rdev->ndev;
+	struct neighbour *neigh = neigh_lookup(&arp_tbl, &be_ip, ndev);
+	int err = 0;
+
+	if (!neigh) {
+		neigh = neigh_create(&arp_tbl, &be_ip, ndev);
+		if (IS_ERR(neigh))
+			return PTR_ERR(neigh);
+	}
+
+	neigh_event_send(neigh, NULL);
+
+	read_lock_bh(&neigh->lock);
+	if ((neigh->nud_state & NUD_VALID) && !neigh->dead)
+		memcpy(mac, neigh->ha, ETH_ALEN);
+	else
+		err = -ENOENT;
+	read_unlock_bh(&neigh->lock);
+
+	neigh_release(neigh);
+
+	return err;
+}
+
+/* Should be called with rswitch_priv->ipv4_forward_lock taken */
+#define RSWITCH_FRAME_TYPE_NUM 3
+static void rswitch_add_ipv4_forward_all_types(struct l3_ipv4_fwd_param *param,
+			struct rswitch_ipv4_route *routing_list)
+{
+	struct l3_ipv4_fwd_param_list *param_list[RSWITCH_FRAME_TYPE_NUM] = {0};
+	struct rswitch_private *priv = routing_list->rdev->priv;
+	int i;
+
+	for (i = 0; i < RSWITCH_FRAME_TYPE_NUM; i++) {
+		param_list[i] = kzalloc(sizeof(**param_list), GFP_ATOMIC);
+		if (!param_list[i])
+			goto free;
+
+		param_list[i]->param = kzalloc(sizeof(*param), GFP_ATOMIC);
+		if (!param_list[i]->param)
+			goto free;
+
+		memcpy(param_list[i]->param, param, sizeof(*param));
+	}
+
+	param_list[0]->param->frame_type = LTHSLP0v4OTHER;
+	param_list[1]->param->frame_type = LTHSLP0v4UDP;
+	param_list[2]->param->frame_type = LTHSLP0v4TCP;
+
+	if (!priv->ipv4_forward_enabled)
+		/* Add these params only to list, not to HW */
+		goto list_add;
+
+	if (rswitch_add_l3fwd(param_list[0]->param))
+		goto free;
+
+	if (rswitch_add_l3fwd(param_list[1]->param)) {
+		rswitch_remove_l3fwd(param_list[0]->param);
+		goto free;
+	}
+
+	if (rswitch_add_l3fwd(param_list[2]->param)) {
+		rswitch_remove_l3fwd(param_list[0]->param);
+		rswitch_remove_l3fwd(param_list[1]->param);
+		goto free;
+	}
+
+list_add:
+	list_add(&param_list[0]->list, &routing_list->param_list);
+	list_add(&param_list[1]->list, &routing_list->param_list);
+	list_add(&param_list[2]->list, &routing_list->param_list);
+
+	return;
+
+free:
+	for (i = 0; i < RSWITCH_FRAME_TYPE_NUM; i++) {
+		if (param_list[i]) {
+			kfree(param_list[i]->param);
+			kfree(param_list[i]);
+		}
+	}
+}
+
+/* Should be called with rswitch_priv->ipv4_forward_lock taken */
+static struct rswitch_ipv4_route *rswitch_get_route(struct rswitch_private *priv, u32 dst_ip)
+{
+	struct rswitch_ipv4_route *routing_list, *default_route;
+	struct rswitch_device *rdev;
+	bool default_present = false;
+
+	read_lock(&priv->rdev_list_lock);
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		list_for_each_entry(routing_list, &rdev->routing_list, list) {
+			/* Handle case, when default route is present; it should be taken last */
+			if (!routing_list->subnet) {
+				default_route = routing_list;
+				default_present = true;
+				continue;
+			}
+
+			if (routing_list->subnet == (dst_ip & routing_list->mask)) {
+				read_unlock(&priv->rdev_list_lock);
+				return routing_list;
+			}
+		}
+	}
+	read_unlock(&priv->rdev_list_lock);
+
+	if (default_present)
+		return default_route;
+
+	return NULL;
+}
+
+static void rswitch_forward_work(struct work_struct *work)
+{
+	struct rswitch_forward_work *fwd_work;
+	struct rswitch_device *rdev;
+	struct rswitch_device *real_rdev;
+	struct net_device *real_ndev;
+	struct rswitch_ipv4_route *routing_list = NULL;
+	struct l3_ipv4_fwd_param param = {0};
+	u8 mac[ETH_ALEN];
+
+	fwd_work = container_of(work, struct rswitch_forward_work, work);
+
+	mutex_lock(&fwd_work->priv->ipv4_forward_lock);
+	if (is_l3_exist(fwd_work->priv, fwd_work->src_ip, fwd_work->dst_ip))
+		goto free;
+
+	routing_list = rswitch_get_route(fwd_work->priv, fwd_work->dst_ip);
+	if (!routing_list)
+		goto free;
+
+	rdev = routing_list->rdev;
+	if (rswitch_ipv4_resolve(rdev, fwd_work->dst_ip, mac))
+		goto free;
+
+	if (is_vlan_dev(rdev->ndev)) {
+		real_ndev = vlan_dev_real_dev(rdev->ndev);
+		real_rdev = netdev_priv(real_ndev);
+		param.dv = BIT(real_rdev->port);
+	} else {
+		param.dv = BIT(rdev->port);
+	}
+	param.csd = 0;
+	param.enable_sub_dst = false;
+	memcpy(param.l23_info.dst_mac, mac, ETH_ALEN);
+	param.slv = 0x3F;
+	param.l23_info.priv = fwd_work->priv;
+	param.l23_info.update_ttl = true;
+	param.l23_info.update_dst_mac = true;
+	param.l23_info.update_src_mac = false;
+	param.l23_info.routing_port_valid = 0x3F;
+	param.l23_info.routing_number = rswitch_rn_get(fwd_work->priv);
+
+	param.priv = fwd_work->priv;
+	param.src_ip = fwd_work->src_ip;
+	param.dst_ip = fwd_work->dst_ip;
+
+	rswitch_add_ipv4_forward_all_types(&param, routing_list);
+
+free:
+	mutex_unlock(&fwd_work->priv->ipv4_forward_lock);
+	kfree(fwd_work);
+}
+
+void rswitch_add_ipv4_forward(struct rswitch_private *priv, u32 src_ip, u32 dst_ip)
+{
+	struct rswitch_forward_work *fwd_work;
+
+	fwd_work = kzalloc(sizeof(*fwd_work), GFP_ATOMIC);
+	if (!fwd_work)
+		return;
+
+	INIT_WORK(&fwd_work->work, rswitch_forward_work);
+	fwd_work->priv = priv;
+	fwd_work->src_ip = src_ip;
+	fwd_work->dst_ip = dst_ip;
+
+	queue_work(priv->rswitch_forward_wq, &fwd_work->work);
+}
+
+void rswitch_mfwd_set_port_based(struct rswitch_private *priv, u8 port,
+			struct rswitch_gwca_chain *rx_chain)
+{
+	int gwca_hw_idx = RSWITCH_HW_NUM_TO_GWCA_IDX(priv->gwca.index);
+
+	if (rx_chain) {
+		rs_write32(rx_chain->index, priv->addr + FWPBFCSDC(gwca_hw_idx, port));
+		rs_write32(BIT(priv->gwca.index), priv->addr + FWPBFC(port));
+	}
+}
+
 static void rswitch_fwd_init(struct rswitch_private *priv)
 {
 	int i;
-	int gwca_hw_idx = RSWITCH_HW_NUM_TO_GWCA_IDX(priv->gwca.index);
+	struct rswitch_device *rdev;
 
 	for (i = 0; i < RSWITCH_NUM_HW; i++) {
 		rs_write32(FWPC0_DEFAULT, priv->addr + FWPC00 + (i * 0x10));
@@ -3031,25 +4084,55 @@ static void rswitch_fwd_init(struct rswitch_private *priv)
 	 * ETHA0 = forward to GWCA0, GWCA0 = forward to ETHA0,...
 	 * Currently, always forward to GWCA1.
 	 */
-	for (i = 0; i < num_etha_ports; i++) {
-		rs_write32(priv->rdev[i]->rx_chain->index, priv->addr + FWPBFCSDC(gwca_hw_idx, i));
-		rs_write32(BIT(priv->gwca.index), priv->addr + FWPBFC(i));
-	}
+	list_for_each_entry(rdev, &priv->rdev_list, list)
+		rswitch_mfwd_set_port_based(priv, rdev->port, rdev->rx_learning_chain);
 
 	/* For GWCA */
 	rs_write32(FWPC0_DEFAULT, priv->addr + FWPC0(priv->gwca.index));
 	rs_write32(FWPC1_DDE, priv->addr + FWPC1(priv->gwca.index));
 	rs_write32(0, priv->addr + FWPBFC(priv->gwca.index));
-	rs_write32(GENMASK(num_etha_ports - 1, 0), priv->addr + FWPBFC(priv->gwca.index));
 
+	/* Enable Direct Descriptors for GWCA1 */
+	rs_write32(FWPC1_DDE, priv->addr + FWPC10 + (priv->gwca.index * 0x10));
+	/* Set L3 hash maximum unsecure entry to 512 */
+	rs_write32(0x200 << 16, priv->addr + FWLTHHEC);
+	/* Disable hash equation */
+	rs_write32(0, priv->addr + FWSFHEC);
+	/* Enable access from unsecure APB for the first 32 update rules */
+	rs_write32(0xffffffff, priv->addr + FWSCR34);
+	/* Enable access from unsecure APB for the first 32 four-byte filters */
+	rs_write32(0xffffffff, priv->addr + FWSCR12);
+	/* Enable access from unsecure APB for the first 32 cascade filters */
+	rs_write32(0xffffffff, priv->addr + FWSCR20);
+	/* Init parameters for IPv4/v6 hash extract */
+	rs_write32(BIT(22) | BIT(23), priv->addr + FWIP4SC);
+	/* Reset L3 table */
+	rs_write32(LTHTIOG, priv->addr + FWLTHTIM);
+	/* TODO: Check result */
+	rswitch_reg_wait(priv->addr, FWLTHTIM, LTHTR, 1);
+	/* Reset L2/3 update table */
+	rs_write32(LTHTIOG, priv->addr + FWL23UTIM);
+	/* TODO: Check result */
+	rswitch_reg_wait(priv->addr, FWL23UTIM, BIT(1), 1);
 	/* TODO: add chrdev for fwd */
 	/* TODO: add proc for fwd */
+
+	/* Enable unsecure APB access to VLAN configuration via FWGC and FWTTCi */
+	rs_write32(BIT(0) | BIT(1), priv->addr + FWSCR0);
+
+	/* Enable SC-Tag filtering mode for VLANs */
+	rs_write32(BIT(1), priv->addr + FWGC);
+
+	/* CPU mirroring */
+	rs_write32(priv->mon_rx_chain->index | (RSWITCH_HW_NUM_TO_GWCA_IDX(priv->gwca.index) << 16),
+				priv->addr + FWCMPTC);
 }
 
 static int rswitch_init(struct rswitch_private *priv)
 {
 	int i;
 	int err;
+	struct rswitch_device *rdev, *tmp;
 
 	/* Non hardware initializations */
 	for (i = 0; i < num_etha_ports; i++)
@@ -3076,10 +4159,34 @@ static int rswitch_init(struct rswitch_private *priv)
 	if (err < 0)
 		goto out;
 
+	priv->rswitch_fib_wq = alloc_ordered_workqueue("rswitch_ordered", 0);
+	if (!priv->rswitch_fib_wq) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	priv->rswitch_netevent_wq = alloc_ordered_workqueue("rswitch_netevent", 0);
+	if (!priv->rswitch_netevent_wq) {
+		err = -ENOMEM;
+		goto fib_wq_destroy;
+	}
+
+	priv->rswitch_forward_wq = alloc_ordered_workqueue("rswitch_forward", 0);
+	if (!priv->rswitch_forward_wq) {
+		err = -ENOMEM;
+		goto netevent_wq_destroy;
+	}
+
 	for (i = 0; i < num_ndev; i++) {
-		err = rswitch_ndev_create(priv, i);
+		err = rswitch_ndev_create(priv, i, false);
 		if (err < 0)
-			goto out;
+			goto forward_wq_destroy;
+
+		if (!parallel_mode) {
+			err = rswitch_ndev_create(priv, i, true);
+			if (err < 0)
+				goto forward_wq_destroy;
+		}
 	}
 
 	/* TODO: chrdev register */
@@ -3087,7 +4194,7 @@ static int rswitch_init(struct rswitch_private *priv)
 	if (!parallel_mode) {
 		err = rswitch_bpool_config(priv);
 		if (err < 0)
-			goto out;
+			goto forward_wq_destroy;
 
 		rswitch_fwd_init(priv);
 		err = rtsn_ptp_init(priv->ptp_priv, RTSN_PTP_REG_LAYOUT_S4, RTSN_PTP_CLOCK_S4);
@@ -3097,23 +4204,44 @@ static int rswitch_init(struct rswitch_private *priv)
 
 	err = rswitch_request_irqs(priv);
 	if (err < 0)
-		goto out;
+		goto forward_wq_destroy;
 	err = rswitch_gwca_ts_request_irqs(priv);
 	if (err < 0)
-		goto out;
+		goto forward_wq_destroy;
 	/* Register devices so Linux network stack can access them now */
 
-	for (i = 0; i < num_ndev; i++) {
-		err = register_netdev(priv->rdev[i]->ndev);
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		err = register_netdev(rdev->ndev);
 		if (err)
-			goto out;
+			goto forward_wq_destroy;
 	}
+
+	if (!parallel_mode)
+		for (i = 0; i < num_ndev; i++) {
+			err = register_netdev(priv->rmon_dev[i]->ndev);
+			if (err)
+				goto forward_wq_destroy;
+		}
 
 	return 0;
 
+forward_wq_destroy:
+	destroy_workqueue(priv->rswitch_forward_wq);
+
+netevent_wq_destroy:
+	destroy_workqueue(priv->rswitch_netevent_wq);
+
+fib_wq_destroy:
+	destroy_workqueue(priv->rswitch_fib_wq);
+
 out:
-	for (i--; i >= 0; i--)
-		rswitch_ndev_unregister(priv, i);
+	list_for_each_entry_safe(rdev, tmp, &priv->rdev_list, list)
+		rswitch_ndev_unregister(rdev, -1);
+
+	for (i = 0; i < num_ndev; i++) {
+		if (priv->rmon_dev[i])
+			rswitch_ndev_unregister(priv->rmon_dev[i], i);
+	}
 
 err_ts_queue_alloc:
 	rswitch_desc_free(priv);
@@ -3121,10 +4249,8 @@ err_ts_queue_alloc:
 	return err;
 }
 
-static void rswitch_deinit_rdev(struct rswitch_private *priv, int index)
+static void rswitch_deinit_rdev(struct rswitch_device *rdev)
 {
-	struct rswitch_device *rdev = priv->rdev[index];
-
 	if (rdev->etha && rdev->etha->operated) {
 		rswitch_phy_deinit(rdev);
 		rswitch_mii_unregister(rdev);
@@ -3133,22 +4259,255 @@ static void rswitch_deinit_rdev(struct rswitch_private *priv, int index)
 
 static void rswitch_deinit(struct rswitch_private *priv)
 {
+	struct rswitch_device *rdev, *tmp;
 	int i;
 
-	for (i = 0; i < num_ndev; i++) {
-		rswitch_deinit_rdev(priv, i);
-		rswitch_ndev_unregister(priv, i);
+	read_lock(&priv->rdev_list_lock);
+	list_for_each_entry_safe(rdev, tmp, &priv->rdev_list, list) {
+		rswitch_deinit_rdev(rdev);
+		rswitch_ndev_unregister(rdev, -1);
 	}
+	read_unlock(&priv->rdev_list_lock);
+
+	for (i = 0; i < RSWITCH_MAX_RMON_DEV; i++)
+		rswitch_ndev_unregister(priv->rmon_dev[i], i);
 
 	rswitch_free_irqs(priv);
 	rswitch_gwca_ts_queue_free(priv);
 	rswitch_desc_free(priv);
 }
 
+static int vlan_dev_register(struct net_device *ndev)
+{
+	struct net_device *real_rdev;
+	struct rswitch_net *rn;
+	struct rswitch_private *priv;
+	struct rswitch_device *rdev, *parent_rdev;
+	int ret;
+
+	rn = net_generic(&init_net, rswitch_net_id);
+	priv = rn->priv;
+
+	real_rdev = vlan_dev_real_dev(ndev);
+
+	if (!ndev_is_tsn_dev(real_rdev, priv))
+		return 0;
+
+	parent_rdev = netdev_priv(real_rdev);
+
+	rdev = kzalloc(sizeof(*rdev), GFP_KERNEL);
+	if (!rdev)
+		return -ENOMEM;
+	/* For VLAN devices, kernel constructs ndev and fills needed structures such as dev.parent,
+	 * but for proper chain mapping R-Switch driver requires real device parent. So we need to
+	 * save pointer to ndev->dev.parent and restore it for proper kernel deinit ndev.
+	 */
+	rdev->vlan_parent = ndev->dev.parent;
+	ndev->dev.parent = real_rdev->dev.parent;
+	rdev->ndev = ndev;
+	rdev->priv = priv;
+	INIT_LIST_HEAD(&rdev->routing_list);
+	INIT_LIST_HEAD(&rdev->tc_u32_list);
+	INIT_LIST_HEAD(&rdev->tc_matchall_list);
+	INIT_LIST_HEAD(&rdev->tc_flower_list);
+	INIT_LIST_HEAD(&rdev->list);
+	rdev->port = -1;
+	rdev->etha = NULL;
+	rdev->addr = priv->addr;
+	spin_lock_init(&rdev->lock);
+	read_lock(&priv->rdev_list_lock);
+	list_add(&rdev->list, &priv->rdev_list);
+	read_unlock(&priv->rdev_list_lock);
+
+	ret = rswitch_txdmac_init(ndev, priv, -1);
+	if (ret)
+		goto err_tx;
+	ret = rswitch_rxdmac_init(ndev, priv, -1);
+	if (ret)
+		goto err_rx;
+
+	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
+	napi_enable(&rdev->napi);
+	return 0;
+err_rx:
+	rswitch_txdmac_free(ndev, priv);
+err_tx:
+	list_del(&rdev->list);
+	return ret;
+}
+
+static void cleanup_all_routes(struct rswitch_device *rdev)
+{
+	struct list_head *cur, *tmp, *cur_param_list, *tmp_param_list;
+	struct rswitch_ipv4_route *routing_list;
+	struct l3_ipv4_fwd_param_list *param_list;
+
+	mutex_lock(&rdev->priv->ipv4_forward_lock);
+	list_for_each_safe(cur, tmp, &rdev->routing_list) {
+		routing_list = list_entry(cur, struct rswitch_ipv4_route, list);
+		routing_list->nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
+		list_for_each_safe(cur_param_list, tmp_param_list, &routing_list->param_list) {
+			param_list =
+				list_entry(cur_param_list, struct l3_ipv4_fwd_param_list, list);
+			rswitch_remove_l3fwd(param_list->param);
+			list_del(cur_param_list);
+			kfree(param_list->param);
+			kfree(param_list);
+		}
+		list_del(&routing_list->list);
+		kfree(routing_list);
+	}
+	mutex_unlock(&rdev->priv->ipv4_forward_lock);
+}
+
+static void vlan_dev_unregister(struct net_device *ndev)
+{
+	struct rswitch_device *rdev;
+	struct rswitch_net *rn;
+	struct rswitch_private *priv;
+
+	rn = net_generic(&init_net, rswitch_net_id);
+	priv = rn->priv;
+	rdev = ndev_to_rdev(ndev);
+	rswitch_rxdmac_free(ndev, priv);
+	rswitch_txdmac_free(ndev, priv);
+	napi_disable(&rdev->napi);
+	netif_napi_del(&rdev->napi);
+
+	cleanup_all_routes(rdev);
+
+	list_del(&rdev->list);
+	ndev->dev.parent = rdev->vlan_parent;
+	kfree(rdev);
+}
+
+static int vlan_device_event(struct notifier_block *unused, unsigned long event,
+			void *ptr)
+{
+	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
+
+	if (!is_vlan_dev(ndev))
+		return NOTIFY_DONE;
+
+	switch (event) {
+		case NETDEV_REGISTER:
+			vlan_dev_register(ndev);
+			break;
+		case NETDEV_UNREGISTER:
+			vlan_dev_unregister(ndev);
+			break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block vlan_notifier_block __read_mostly = {
+	.notifier_call = vlan_device_event,
+};
+
+static void rswitch_netevent_work(struct work_struct *work)
+{
+	struct rswitch_net *rn;
+	struct rswitch_private *priv;
+	struct rswitch_device *rdev;
+	struct rswitch_ipv4_route *routing_list;
+	struct l3_ipv4_fwd_param_list *l3_param_list;
+
+	rn = net_generic(&init_net, rswitch_net_id);
+	priv = rn->priv;
+
+	mutex_lock(&priv->ipv4_forward_lock);
+
+	priv->ipv4_forward_enabled = !!IPV4_DEVCONF_ALL(&init_net, FORWARDING);
+
+	read_lock(&priv->rdev_list_lock);
+	list_for_each_entry(rdev, &priv->rdev_list, list)
+		list_for_each_entry(routing_list, &rdev->routing_list, list)
+			list_for_each_entry(l3_param_list, &routing_list->param_list, list) {
+				/* Skip params related to dst interface route (zero src) */
+				if (l3_param_list->param->src_ip)
+					rswitch_modify_l3fwd(l3_param_list->param,
+							     !priv->ipv4_forward_enabled);
+			}
+	read_unlock(&priv->rdev_list_lock);
+	mutex_unlock(&priv->ipv4_forward_lock);
+
+	kfree(work);
+}
+
+static int rswitch_netevent_cb(struct notifier_block *unused, unsigned long event, void *ptr)
+{
+	struct rswitch_net *rn;
+	struct rswitch_private *priv;
+	struct work_struct *work;
+
+	if (event != NETEVENT_IPV4_FORWARD_UPDATE)
+		return NOTIFY_DONE;
+
+	rn = net_generic(&init_net, rswitch_net_id);
+	priv = rn->priv;
+
+	work = kzalloc(sizeof(*work), GFP_ATOMIC);
+	if (!work)
+		return -ENOMEM;
+
+	INIT_WORK(work, rswitch_netevent_work);
+	queue_work(priv->rswitch_netevent_wq, work);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block netevent_notifier = {
+	.notifier_call = rswitch_netevent_cb,
+};
+
+static ssize_t l3_offload_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	return sysfs_emit(buf, "%d\n", glob_priv->offload_enabled);
+}
+
+static void rswitch_disable_offload(struct rswitch_private *priv)
+{
+	struct rswitch_device *rdev;
+
+	read_lock(&priv->rdev_list_lock);
+	list_for_each_entry(rdev, &priv->rdev_list, list)
+		cleanup_all_routes(rdev);
+	read_unlock(&priv->rdev_list_lock);
+}
+
+static ssize_t l3_offload_store(struct device *dev, struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	long new_value;
+
+	if (kstrtol(buf, 10, &new_value))
+		return -EINVAL;
+
+	new_value = !!new_value;
+	if (new_value != glob_priv->offload_enabled) {
+		if (new_value) {
+			register_fib_notifier(&init_net, &glob_priv->fib_nb, NULL, NULL);
+		} else {
+			unregister_fib_notifier(&init_net, &glob_priv->fib_nb);
+			rswitch_disable_offload(glob_priv);
+		}
+
+		glob_priv->offload_enabled = new_value;
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(l3_offload);
+
 static int renesas_eth_sw_probe(struct platform_device *pdev)
 {
 	struct rswitch_private *priv;
 	struct resource *res, *res_serdes;
+	struct rswitch_net *rn;
 	int ret;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -3162,6 +4521,8 @@ static int renesas_eth_sw_probe(struct platform_device *pdev)
 	if (!priv)
 		return -ENOMEM;
 
+	INIT_LIST_HEAD(&priv->rdev_list);
+	rwlock_init(&priv->rdev_list_lock);
 	priv->ptp_priv = rtsn_ptp_alloc(pdev);
 	if (!priv->ptp_priv)
 		return -ENOMEM;
@@ -3208,6 +4569,8 @@ static int renesas_eth_sw_probe(struct platform_device *pdev)
 		return PTR_ERR(priv->serdes_addr);
 
 	debug_addr = priv->addr;
+	priv->dev_id = res->start;
+
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(40));
 	if (ret < 0) {
 		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
@@ -3217,7 +4580,7 @@ static int renesas_eth_sw_probe(struct platform_device *pdev)
 
 	/* Fixed to use GWCA1 */
 	priv->gwca.index = 4;
-	priv->gwca.num_chains = num_ndev * NUM_CHAINS_PER_NDEV;
+	priv->gwca.num_chains = RSWITCH_MAX_NUM_CHAINS;
 	priv->gwca.chains = devm_kcalloc(&pdev->dev, priv->gwca.num_chains,
 					 sizeof(*priv->gwca.chains), GFP_KERNEL);
 	if (!priv->gwca.chains)
@@ -3230,11 +4593,73 @@ static int renesas_eth_sw_probe(struct platform_device *pdev)
 		clk_enable(priv->phy_clk);
 	}
 
-	rswitch_init(priv);
+	/* In case of error, rswitch_init will free allocated resources by itself */
+	ret = rswitch_init(priv);
+	if (ret)
+		goto disable_clocks;
 
 	device_set_wakeup_capable(&pdev->dev, 1);
 
+	glob_priv = priv;
+
+	if (!parallel_mode) {
+		ret = register_pernet_subsys(&rswitch_net_ops);
+		if (ret)
+			goto disable_clocks;
+
+		rn = net_generic(&init_net, rswitch_net_id);
+		rn->priv = priv;
+
+		ret = register_netdevice_notifier(&vlan_notifier_block);
+		if (ret)
+			goto unregister_pernet_subsys;
+
+		priv->ipv4_forward_enabled = !!IPV4_DEVCONF_ALL(&init_net, FORWARDING);
+		mutex_init(&priv->ipv4_forward_lock);
+		ret = register_netevent_notifier(&netevent_notifier);
+		if (ret)
+			goto unregister_vlan_notifier;
+
+		priv->fib_nb.notifier_call = rswitch_fib_event;
+		ret = register_fib_notifier(&init_net, &priv->fib_nb, NULL, NULL);
+		if (ret)
+			goto unregister_netevent_notifier;
+
+		priv->offload_enabled = true;
+		ret = device_create_file(&pdev->dev, &dev_attr_l3_offload);
+		if (ret) {
+			dev_err(&priv->pdev->dev, "failed to register offload attribute, ret=%d\n",
+						ret);
+			goto unregister_fib_notifier;
+		}
+	}
+
 	return 0;
+
+unregister_fib_notifier:
+	unregister_fib_notifier(&init_net, &priv->fib_nb);
+
+unregister_netevent_notifier:
+	unregister_netevent_notifier(&netevent_notifier);
+
+unregister_vlan_notifier:
+	unregister_netdevice_notifier(&vlan_notifier_block);
+
+unregister_pernet_subsys:
+	unregister_pernet_subsys(&rswitch_net_ops);
+
+disable_clocks:
+	if (!parallel_mode) {
+		/* Disable R-Switch clock */
+		rs_write32(RCDC_RCD, priv->addr + RCDC);
+		rswitch_deinit(priv);
+
+		pm_runtime_put(&pdev->dev);
+		pm_runtime_disable(&pdev->dev);
+		clk_disable(priv->phy_clk);
+	}
+
+	return ret;
 }
 
 static int renesas_eth_sw_remove(struct platform_device *pdev)
@@ -3242,6 +4667,14 @@ static int renesas_eth_sw_remove(struct platform_device *pdev)
 	struct rswitch_private *priv = platform_get_drvdata(pdev);
 
 	if (!parallel_mode) {
+		device_remove_file(&pdev->dev, &dev_attr_l3_offload);
+		unregister_fib_notifier(&init_net, &priv->fib_nb);
+		destroy_workqueue(priv->rswitch_fib_wq);
+		unregister_netevent_notifier(&netevent_notifier);
+		destroy_workqueue(priv->rswitch_netevent_wq);
+		unregister_netdevice_notifier(&vlan_notifier_block);
+		destroy_workqueue(priv->rswitch_forward_wq);
+		unregister_pernet_subsys(&rswitch_net_ops);
 		/* Disable R-Switch clock */
 		rs_write32(RCDC_RCD, priv->addr + RCDC);
 		rswitch_deinit(priv);
@@ -3255,6 +4688,7 @@ static int renesas_eth_sw_remove(struct platform_device *pdev)
 	rswitch_desc_free(priv);
 
 	platform_set_drvdata(pdev, NULL);
+	glob_priv = NULL;
 
 	return 0;
 }
@@ -3262,12 +4696,13 @@ static int renesas_eth_sw_remove(struct platform_device *pdev)
 static int __maybe_unused rswitch_suspend(struct device *dev)
 {
 	struct rswitch_private *priv = dev_get_drvdata(dev);
+	struct rswitch_device *rdev;
 	int i;
 
-	for (i = 0; i < num_ndev; i++) {
-		struct net_device *ndev = priv->rdev[i]->ndev;
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		struct net_device *ndev = rdev->ndev;
 
-		if (priv->rdev[i]->tx_chain->index < 0)
+		if (rdev->tx_chain->index < 0)
 			continue;
 
 		if (netif_running(ndev)) {
@@ -3277,7 +4712,7 @@ static int __maybe_unused rswitch_suspend(struct device *dev)
 
 		rswitch_txdmac_free(ndev, priv);
 		rswitch_rxdmac_free(ndev, priv);
-		priv->rdev[i]->etha->operated = false;
+		rdev->etha->operated = false;
 	}
 
 	priv->serdes_common_init = false;
@@ -3293,11 +4728,11 @@ static int rswitch_resume_chan(struct net_device *ndev)
 	struct rswitch_device *rdev = netdev_priv(ndev);
 	int ret;
 
-	ret = rswitch_rxdmac_init(ndev, rdev->priv);
+	ret = rswitch_rxdmac_init(ndev, rdev->priv, -1);
 	if (ret)
 		goto out_dmac;
 
-	ret = rswitch_txdmac_init(ndev, rdev->priv);
+	ret = rswitch_txdmac_init(ndev, rdev->priv, -1);
 	if (ret) {
 		rswitch_rxdmac_free(ndev, rdev->priv);
 		goto out_dmac;
@@ -3329,6 +4764,7 @@ out_dmac:
 static int __maybe_unused rswitch_resume(struct device *dev)
 {
 	struct rswitch_private *priv = dev_get_drvdata(dev);
+	struct rswitch_device *rdev;
 	int i, ret, err = 0;
 
 	ret = rswitch_desc_alloc(priv);
@@ -3363,10 +4799,10 @@ static int __maybe_unused rswitch_resume(struct device *dev)
 			return ret;
 	}
 
-	for (i = 0; i < num_ndev; i++) {
-		struct net_device *ndev = priv->rdev[i]->ndev;
+	list_for_each_entry(rdev, &priv->rdev_list, list) {
+		struct net_device *ndev = rdev->ndev;
 
-		if (priv->rdev[i]->tx_chain->index >= 0) {
+		if (rdev->tx_chain->index >= 0) {
 			ret = rswitch_resume_chan(ndev);
 			if (ret) {
 				pr_info("Failed to resume %s", ndev->name);
