@@ -1214,49 +1214,6 @@ static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch
 		if (--boguscnt < 0)
 			break;
 
-		if (rdev->mondev) {
-			int slv;
-
-			slv = ((desc->info1 & L3_SLV_DESC_MASK) >> L3_SLV_DESC_SHIFT);
-			if (slv >= RSWITCH_MAX_RMON_DEV)
-				continue;
-
-			ndev = priv->rmon_dev[slv]->ndev;
-			skb->dev = ndev;
-		}
-
-		if (priv->offload_enabled) {
-			struct ethhdr *ethhdr;
-
-			skb_reset_mac_header(skb);
-			ethhdr = (struct ethhdr*)skb_mac_header(skb);
-			if (learn_chain) {
-				struct iphdr *iphdr;
-
-				skb_reset_network_header(skb);
-				if (skb_is_vlan(skb)) {
-					skb_set_network_header(skb, sizeof(*ethhdr) +
-							       VLAN_HEADER_SIZE);
-				} else {
-					skb_set_network_header(skb, sizeof(*ethhdr));
-				}
-
-				/* The L2 broadcast packets shouldn't be routed */
-				if (!is_broadcast_ether_addr(ethhdr->h_dest)) {
-					iphdr = ip_hdr(skb);
-					rswitch_add_ipv4_forward(priv, rdev,
-								 be32_to_cpu(iphdr->saddr),
-								 be32_to_cpu(iphdr->daddr));
-				}
-			} else if (is_multicast_ether_addr(ethhdr->h_dest)) {
-				/* The multicast packets that are forwarded by L3 offload to
-				 * default chain will be forwarded in HW. So we need to mark
-				 * these packets for kernel to avoid double forward by HW and SW.
-				 */
-				skb->offload_l3_fwd_mark = 1;
-			}
-		}
-
 		dma_addr = le32_to_cpu(desc->dptrl) | ((__le64)le32_to_cpu(desc->dptrh) << 32);
 		dma_unmap_single(ndev->dev.parent, dma_addr,
 				 RSWITCH_RX_BUF_SIZE - NET_SKB_PAD - NET_IP_ALIGN,
@@ -1318,6 +1275,49 @@ static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch
 			skb_checksum_none_assert(skb);
 			skb_reserve(skb, NET_SKB_PAD + NET_IP_ALIGN);
 			skb_put(skb, pkt_len);
+		}
+
+		if (rdev->mondev) {
+			int slv;
+
+			slv = ((desc->info1 & L3_SLV_DESC_MASK) >> L3_SLV_DESC_SHIFT);
+			if (slv >= RSWITCH_MAX_RMON_DEV)
+				continue;
+
+			ndev = priv->rmon_dev[slv]->ndev;
+			skb->dev = ndev;
+		}
+
+		if (priv->offload_enabled) {
+			struct ethhdr *ethhdr;
+
+			skb_reset_mac_header(skb);
+			ethhdr = (struct ethhdr*)skb_mac_header(skb);
+			if (learn_chain) {
+				struct iphdr *iphdr;
+
+				skb_reset_network_header(skb);
+				if (skb_is_vlan(skb)) {
+					skb_set_network_header(skb, sizeof(*ethhdr) +
+							    VLAN_HEADER_SIZE);
+				} else {
+					skb_set_network_header(skb, sizeof(*ethhdr));
+				}
+
+				/* The L2 broadcast packets shouldn't be routed */
+				if (!is_broadcast_ether_addr(ethhdr->h_dest)) {
+					iphdr = ip_hdr(skb);
+					rswitch_add_ipv4_forward(priv, rdev,
+								be32_to_cpu(iphdr->saddr),
+								be32_to_cpu(iphdr->daddr));
+				}
+			} else if (is_multicast_ether_addr(ethhdr->h_dest)) {
+				/* The multicast packets that are forwarded by L3 offload to
+				 * default chain will be forwarded in HW. So we need to mark
+				 * these packets for kernel to avoid double forward by HW and SW.
+				 */
+				skb->offload_l3_fwd_mark = 1;
+			}
 		}
 
 		if (!rswitch_is_front_dev(rdev))
