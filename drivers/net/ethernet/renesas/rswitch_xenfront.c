@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Renesas Ethernet Switch Para-Virtualized driver
+ *
+ * Copyright (C) 2022 EPAM Systems
+ */
+
+#include <linux/dma-mapping.h>
+#include <linux/of_device.h>
+#include <linux/etherdevice.h>
+#include <linux/platform_device.h>
+#include <xen/interface/grant_table.h>
+#include <xen/grant_table.h>
+#include <xen/xenbus.h>
+#include <xen/page.h>
+#include <xen/events.h>
+#include "rswitch.h"
+
+static DECLARE_WAIT_QUEUE_HEAD(module_wq);
+
+struct rswitch_vmq_front_info {
+	evtchn_port_t rx_evtchn;
+	evtchn_port_t tx_evtchn;
+	int rx_irq;
+	int tx_irq;
+	struct net_device *ndev;
+	struct xenbus_device *xbdev;
+	int gref;
+};
+
+/* Global state to hold some data like LINKFIX table */
+struct rswitch_private *rswitch_front_priv;
+DEFINE_SPINLOCK(rswitch_front_priv_lock);
+
+static struct rswitch_private *get_priv(void)
+{
+	struct rswitch_private *ret = NULL;
+
+	spin_lock(&rswitch_front_priv_lock);
+
+	if (!rswitch_front_priv)
+		goto out;
+
+	if (!get_device(&rswitch_front_priv->pdev->dev))
+		goto out;
+
+	ret = rswitch_front_priv;
+out:
+	spin_unlock(&rswitch_front_priv_lock);
+
+	return ret;
+}
+
+static void put_priv(struct rswitch_private *priv)
+{
+	put_device(&priv->pdev->dev);
+}
+
+static struct net_device*
+		rswitch_vmq_front_ndev_allocate(struct xenbus_device *xbd)
+{
+	struct net_device *ndev;
+	struct rswitch_device *rdev;
+
+	ndev = alloc_etherdev_mqs(sizeof(struct rswitch_device), 1, 1);
+
+	if (!ndev)
+		return ERR_PTR(-ENOMEM);
+
+	SET_NETDEV_DEV(ndev, &xbd->dev);
+
+	ether_setup(ndev);
+
+	rdev = netdev_priv(ndev);
+	rdev->front_info = devm_kzalloc(&xbd->dev,
+					sizeof(struct rswitch_vmq_front_info),
+					GFP_KERNEL);
+	if (!rdev->front_info)
+		goto out_free_netdev;
+
+	rdev->front_info->ndev = ndev;
+	rdev->front_info->xbdev = xbd;
+	rdev->ndev = ndev;
+	rdev->priv = get_priv();
+	rdev->etha = NULL;
+	rdev->remote_chain = 0;
+	rdev->addr = NULL;
+
+	spin_lock_init(&rdev->lock);
+
+	ndev->features = NETIF_F_RXCSUM;
+	ndev->hw_features = NETIF_F_RXCSUM;
+	ndev->base_addr = (unsigned long)rdev->addr;
+	ndev->netdev_ops = &rswitch_netdev_ops;
+
+	return ndev;
+
+out_free_netdev:
+	free_netdev(ndev);
+
+	return ERR_PTR(-ENOMEM);
+}
+
+static int rswitch_vmq_front_ndev_register(struct rswitch_device *rdev,
+					   const char *type,
+					   int index,
+					   int tx_chain_num,
+					   int rx_chain_num,
+					   u8* mac)
+{
+	struct net_device *ndev = rdev->ndev;
+	int err;
+
+	snprintf(ndev->name, IFNAMSIZ, "%s%d", type, index);
+
+	if (strcmp(type, "tsn") == 0) {
+		rdev->port = index;
+		rdev->rdev_type = RSWITCH_TSN_DEV;
+	} else {
+		rdev->rdev_type = RSWITCH_VMQ_FRONT_DEV;
+		rdev->port = rdev->priv->gwca.index;
+	}
+
+	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+
+	if (!mac)
+		eth_hw_addr_random(ndev);
+	else
+		ether_addr_copy(ndev->dev_addr, mac);
+
+	err = rswitch_rxdmac_init(ndev, rdev->priv, rx_chain_num);
+	if (err < 0)
+		goto out_rxdmac;
+
+	err = rswitch_txdmac_init(ndev, rdev->priv, tx_chain_num);
+	if (err < 0)
+		goto out_txdmac;
+
+	/* Network device register */
+	err = register_netdev(ndev);
+	if (err)
+		goto out_reg_netdev;
+
+	/* Print device information */
+	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
+
+	return 0;
+
+out_reg_netdev:
+	rswitch_txdmac_free(ndev, NULL);
+
+out_txdmac:
+	rswitch_rxdmac_free(ndev, NULL);
+
+out_rxdmac:
+	netif_napi_del(&rdev->napi);
+
+	return err;
+}
+
+static void rswitch_vmq_front_ndev_unregister(struct rswitch_device *rdev)
+{
+	struct net_device *ndev = rdev->ndev;
+
+	rswitch_txdmac_free(ndev, rdev->priv);
+	rswitch_rxdmac_free(ndev, rdev->priv);
+
+	unregister_netdev(ndev);
+	netif_napi_del(&rdev->napi);
+	free_netdev(ndev);
+}
+
+static irqreturn_t rswitch_vmq_front_rx_interrupt(int irq, void *dev_id)
+{
+	struct rswitch_device *rdev = dev_id;
+
+	napi_schedule(&rdev->napi);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t rswitch_vmq_front_tx_interrupt(int irq, void *dev_id)
+{
+	struct rswitch_device *rdev = dev_id;
+
+	napi_schedule(&rdev->napi);
+
+	/* TODO: This is better, but there is a possibility for locking issues */
+	/* rswitch_tx_free(rdev->ndev, true); */
+
+	return IRQ_HANDLED;
+}
+
+void rswitch_vmq_front_trigger_tx(struct rswitch_device *rdev)
+{
+	struct rswitch_vmq_front_info *np = rdev->front_info;
+
+	notify_remote_via_evtchn(np->tx_evtchn);
+}
+
+void rswitch_vmq_front_rx_done(struct rswitch_device *rdev)
+{
+	struct rswitch_vmq_front_info *np = rdev->front_info;
+
+	notify_remote_via_evtchn(np->rx_evtchn);
+}
+
+static int rswitch_vmq_front_connect(struct net_device *dev)
+{
+	struct rswitch_device *rdev = netdev_priv(dev);
+	struct rswitch_vmq_front_info *np = rdev->front_info;
+	unsigned int tx_chain_id, rx_chain_id, index;
+	unsigned int remote_chain_id;
+	int err;
+	char *type;
+	char *mac_str;
+	u8 mac[ETH_ALEN];
+
+	tx_chain_id = xenbus_read_unsigned(np->xbdev->otherend,
+					   "tx-chain-id", 0);
+	rx_chain_id = xenbus_read_unsigned(np->xbdev->otherend,
+					   "rx-chain-id", 0);
+	remote_chain_id = xenbus_read_unsigned(np->xbdev->otherend,
+					   "remote-chain-id", 0);
+	index = xenbus_read_unsigned(np->xbdev->nodename, "if-num", ~0U);
+
+	if (!tx_chain_id || !rx_chain_id) {
+		dev_info(&np->xbdev->dev, "backend did not supplied chain id\n");
+		return -ENODEV;
+	}
+
+	type = xenbus_read(XBT_NIL, np->xbdev->nodename, "type", NULL);
+	if (!type) {
+		dev_info(&np->xbdev->dev, "toolstack did not supplied type\n");
+		return -ENODEV;
+	}
+
+	mac_str = xenbus_read(XBT_NIL, np->xbdev->otherend, "mac", NULL);
+	if (IS_ERR(mac_str)) {
+		mac_str = NULL;
+	} else if (!mac_pton(mac_str, mac)) {
+		dev_info(&np->xbdev->dev, "Failed to parse MAC %s\n", mac_str);
+		err = -ENODEV;
+		goto err_free_mac;
+	}
+
+	err = rswitch_vmq_front_ndev_register(rdev, type, index, tx_chain_id,
+					      rx_chain_id, mac_str ? mac : NULL);
+	if (err)
+		goto err_free_mac;
+
+	err = xenbus_alloc_evtchn(np->xbdev, &np->rx_evtchn);
+	if (err) {
+		xenbus_dev_fatal(np->xbdev, err,
+				 "Failed to allocate RX event channel: %d\n", err);
+		goto err_ndev_unregister;
+	}
+
+	err = xenbus_alloc_evtchn(np->xbdev, &np->tx_evtchn);
+	if (err) {
+		xenbus_dev_fatal(np->xbdev, err,
+				 "Failed to allocate TX event channel: %d\n", err);
+		goto err_free_rx_evch;
+	}
+
+	err = bind_evtchn_to_irqhandler(np->rx_evtchn,
+					rswitch_vmq_front_rx_interrupt,
+					0, rdev->ndev->name, rdev);
+	if (err < 0) {
+		xenbus_dev_fatal(np->xbdev, err,
+				 "Failed to bind RX event channel: %d\n", err);
+		goto err_free_tx_evch;
+	}
+	np->rx_irq = err;
+
+	err = bind_evtchn_to_irqhandler(np->tx_evtchn,
+					rswitch_vmq_front_tx_interrupt,
+					0, rdev->ndev->name, rdev);
+	if (err < 0) {
+		xenbus_dev_fatal(np->xbdev, err,
+				 "Failed to bind TX event channel: %d\n", err);
+		goto err_unbind_rx_irq;
+	}
+	np->tx_irq = err;
+
+	rdev->remote_chain = remote_chain_id;
+
+	err = xenbus_printf(XBT_NIL, np->xbdev->nodename, "rx-evtch", "%u", np->rx_evtchn);
+	if (err) {
+		xenbus_dev_fatal(np->xbdev, err,
+				 "Failed to write RX event channel id: %d\n", err);
+		goto err_unbind_tx_irq;
+	}
+
+	err = xenbus_printf(XBT_NIL, np->xbdev->nodename, "tx-evtch", "%u", np->tx_evtchn);
+	if (err) {
+		xenbus_dev_fatal(np->xbdev, err,
+				 "Failed to write TX event channel id: %d\n", err);
+		goto err_unbind_tx_irq;
+	}
+
+	if (strcmp(type, "vmq") == 0) {
+		rdev->vmq_info =
+			(struct rswitch_vmq_status *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+		if (!rdev->vmq_info) {
+			dev_err(&np->xbdev->dev, "failed to get free kernel page for gnttab\n");
+			goto err_unbind_tx_irq;
+		}
+
+		np->gref = gnttab_grant_foreign_access(np->xbdev->otherend_id,
+						       virt_to_gfn(rdev->vmq_info), 0);
+		if (np->gref < 0) {
+			dev_err(&np->xbdev->dev, "failed to grant access for gnttab\n");
+			goto err_free_shared_page;
+		}
+
+		WRITE_ONCE(rdev->vmq_info->version, VMQ_INFO_VERSION);
+		WRITE_ONCE(rdev->vmq_info->front_tx, 0);
+		WRITE_ONCE(rdev->vmq_info->front_rx, 0);
+		WRITE_ONCE(rdev->vmq_info->tx_front_ring_size, RX_RING_SIZE);
+		WRITE_ONCE(rdev->vmq_info->rx_front_ring_size, TX_RING_SIZE);
+		WRITE_ONCE(rdev->vmq_info->scheduled_tx, false);
+
+		err = xenbus_printf(XBT_NIL, np->xbdev->nodename, "gref",
+				    "%u", np->gref);
+		if (err) {
+			xenbus_dev_fatal(np->xbdev, err,
+					 "Failed to write gref: %d\n", err);
+			goto err_end_foreign_access;
+		}
+	} else {
+		rdev->vmq_info = NULL;
+	}
+
+	kfree(mac_str);
+	kfree(type);
+
+	return 0;
+
+err_end_foreign_access:
+	gnttab_end_foreign_access(np->gref, 0, 0);
+err_free_shared_page:
+	free_page((unsigned long)rdev->vmq_info);
+err_unbind_tx_irq:
+	unbind_from_irqhandler(np->tx_irq, rdev);
+	np->tx_irq = 0;
+err_unbind_rx_irq:
+	unbind_from_irqhandler(np->rx_irq, rdev);
+	np->rx_irq = 0;
+err_free_tx_evch:
+	xenbus_free_evtchn(np->xbdev, np->tx_evtchn);
+	np->tx_evtchn = 0;
+err_free_rx_evch:
+	xenbus_free_evtchn(np->xbdev, np->rx_evtchn);
+	np->rx_evtchn = 0;
+err_ndev_unregister:
+	rswitch_vmq_front_ndev_unregister(rdev);
+err_free_mac:
+	kfree(mac_str);
+	kfree(type);
+
+	return err;
+}
+
+static int rswitch_vmq_front_probe(struct xenbus_device *dev,
+				   const struct xenbus_device_id *id)
+{
+	int err;
+	struct net_device *netdev;
+	struct rswitch_private *priv;
+
+	priv = get_priv();
+	if (!priv)
+		return -EPROBE_DEFER;
+
+	netdev = rswitch_vmq_front_ndev_allocate(dev);
+	put_priv(priv);
+
+	if (IS_ERR(netdev)) {
+		err = PTR_ERR(netdev);
+		xenbus_dev_fatal(dev, err, "creating netdev");
+		return err;
+	}
+
+	dev_set_drvdata(&dev->dev, netdev_priv(netdev));
+	err = dma_coerce_mask_and_coherent(&dev->dev, DMA_BIT_MASK(40));
+
+	do {
+		xenbus_switch_state(dev, XenbusStateInitialising);
+		err = wait_event_timeout(module_wq,
+					 xenbus_read_driver_state(dev->otherend) !=
+					 XenbusStateClosed &&
+					 xenbus_read_driver_state(dev->otherend) !=
+					 XenbusStateUnknown, 5 * HZ);
+	} while (!err);
+
+	return 0;
+}
+
+static void xenbus_close(struct xenbus_device *dev)
+{
+	int ret;
+
+	if (xenbus_read_driver_state(dev->otherend) == XenbusStateClosed)
+		return;
+	do {
+		xenbus_switch_state(dev, XenbusStateClosing);
+		ret = wait_event_timeout(module_wq,
+					 xenbus_read_driver_state(dev->otherend) ==
+					 XenbusStateClosing ||
+					 xenbus_read_driver_state(dev->otherend) ==
+					 XenbusStateClosed ||
+					 xenbus_read_driver_state(dev->otherend) ==
+					 XenbusStateUnknown,
+					 5 * HZ);
+	} while (!ret);
+
+	if (xenbus_read_driver_state(dev->otherend) == XenbusStateClosed)
+		return;
+
+	do {
+		xenbus_switch_state(dev, XenbusStateClosed);
+		ret = wait_event_timeout(module_wq,
+					 xenbus_read_driver_state(dev->otherend) ==
+					 XenbusStateClosed ||
+					 xenbus_read_driver_state(dev->otherend) ==
+					 XenbusStateUnknown,
+					 5 * HZ);
+	} while (!ret);
+}
+
+static void rswitch_vmq_front_disconnect_backend(struct rswitch_vmq_front_info *info)
+{
+	if (info->rx_irq)
+		unbind_from_irqhandler(info->rx_irq, dev_get_drvdata(&info->xbdev->dev));
+	if (info->tx_irq)
+		unbind_from_irqhandler(info->tx_irq, dev_get_drvdata(&info->xbdev->dev));
+	if (info->rx_evtchn)
+		xenbus_free_evtchn(info->xbdev, info->rx_evtchn);
+	if (info->tx_evtchn)
+		xenbus_free_evtchn(info->xbdev, info->tx_evtchn);
+
+	info->rx_irq = 0;
+	info->tx_irq = 0;
+	info->rx_evtchn = 0;
+	info->tx_evtchn = 0;
+}
+
+static int rswitch_vmq_front_remove(struct xenbus_device *dev)
+{
+	struct rswitch_device *rdev = dev_get_drvdata(&dev->dev);
+	struct rswitch_vmq_front_info *np = rdev->front_info;
+
+	xenbus_close(dev);
+	rswitch_vmq_front_disconnect_backend(np);
+	if (rdev->rdev_type == RSWITCH_VMQ_FRONT_DEV) {
+		gnttab_end_foreign_access(np->gref, 0, 0);
+		free_page((unsigned long)rdev->vmq_info);
+	}
+	unbind_from_irqhandler(np->tx_irq, rdev);
+	unbind_from_irqhandler(np->rx_irq, rdev);
+	xenbus_free_evtchn(np->xbdev, np->tx_evtchn);
+	xenbus_free_evtchn(np->xbdev, np->rx_evtchn);
+	rswitch_vmq_front_ndev_unregister(rdev);
+
+	return 0;
+}
+
+static void rswitch_vmq_front_changed(struct xenbus_device *dev,
+			    enum xenbus_state backend_state)
+{
+	struct rswitch_device *priv = dev_get_drvdata(&dev->dev);
+	struct net_device *netdev = priv->ndev;
+
+	wake_up_all(&module_wq);
+
+	switch (backend_state) {
+	case XenbusStateInitialising:
+	case XenbusStateInitialised:
+	case XenbusStateReconfiguring:
+	case XenbusStateReconfigured:
+	case XenbusStateUnknown:
+		break;
+
+	case XenbusStateInitWait:
+		if (dev->state != XenbusStateInitialising)
+			break;
+		if (rswitch_vmq_front_connect(netdev) != 0)
+			break;
+		xenbus_switch_state(dev, XenbusStateConnected);
+		break;
+
+	case XenbusStateConnected:
+		break;
+
+	case XenbusStateClosed:
+		if (dev->state == XenbusStateClosed)
+			break;
+		fallthrough;	/* Missed the backend's CLOSING state */
+	case XenbusStateClosing:
+		xenbus_frontend_closed(dev);
+		break;
+	}
+}
+
+static const struct xenbus_device_id rswitch_vmq_front_ids[] = {
+	{ "renesas_vmq" },
+	{ "" }
+};
+
+static struct xenbus_driver rswitch_vmq_front_driver = {
+	.ids = rswitch_vmq_front_ids,
+	.probe = rswitch_vmq_front_probe,
+	.remove = rswitch_vmq_front_remove,
+	.otherend_changed = rswitch_vmq_front_changed,
+};
+
+static const struct of_device_id renesas_vmq_of_table[] = {
+	{ .compatible = "renesas,etherswitch-xen", },
+	{ }
+};
+
+MODULE_DEVICE_TABLE(of, renesas_vmq_of_table);
+
+static int renesas_vmq_of_dev_probe(struct platform_device *pdev)
+{
+	struct rswitch_private *priv;
+	int err;
+
+	dev_info(&pdev->dev, "Initializing virtual R-Switch front-end device\n");
+
+	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv->pdev = pdev;
+	priv->gwca.num_chains = 32;
+	priv->gwca.index = 4;
+
+	err = rswitch_desc_alloc(priv);
+	if (err < 0)
+		return -ENOMEM;
+
+	platform_set_drvdata(pdev, priv);
+
+	spin_lock(&rswitch_front_priv_lock);
+	if (rswitch_front_priv)
+		WARN(true, "rswitch_front_priv is already set\n");
+	else
+		rswitch_front_priv = priv;
+	spin_unlock(&rswitch_front_priv_lock);
+
+	return 0;
+}
+
+static int renesas_vmq_of_dev_remove(struct platform_device *pdev)
+{
+	struct rswitch_private *priv;
+
+	dev_info(&pdev->dev, "Removing virtual R-Switch front-end device\n");
+
+	priv = platform_get_drvdata(pdev);
+	rswitch_desc_free(priv);
+
+	platform_set_drvdata(pdev, NULL);
+
+	spin_lock(&rswitch_front_priv_lock);
+	if (rswitch_front_priv == priv)
+		rswitch_front_priv = NULL;
+	spin_unlock(&rswitch_front_priv_lock);
+
+	return 0;
+}
+
+static struct platform_driver renesas_vmq_of_dev = {
+	.probe = renesas_vmq_of_dev_probe,
+	.remove = renesas_vmq_of_dev_remove,
+	.driver = {
+		.name = "renesas_vmq",
+		.of_match_table = renesas_vmq_of_table,
+	}
+};
+
+static int __init rswitch_vmq_front_init(void)
+{
+	if (!xen_domain())
+		return -ENODEV;
+
+	platform_driver_register(&renesas_vmq_of_dev);
+
+	return xenbus_register_frontend(&rswitch_vmq_front_driver);
+}
+module_init(rswitch_vmq_front_init);
+
+
+static void __exit rswitch_vmq_front_exit(void)
+{
+	xenbus_unregister_driver(&rswitch_vmq_front_driver);
+	platform_driver_unregister(&renesas_vmq_of_dev);
+}
+module_exit(rswitch_vmq_front_exit);
+
+MODULE_DESCRIPTION("Renesas R-Switch PV driver front-end");
+MODULE_LICENSE("GPL");
